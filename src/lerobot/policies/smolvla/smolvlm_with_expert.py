@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -71,6 +72,52 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+def _select_visual_tokens(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    visual_token_spans: tuple[tuple[int, int], ...],
+    keep_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select visual K/V per camera and sample while retaining every non-visual position."""
+    batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
+    num_query_heads = query_states.shape[2]
+    key_for_scores = key_states.repeat_interleave(num_query_heads // num_key_value_heads, dim=2)
+    scores = torch.einsum("bqhd,blhd->bl", query_states.float(), key_for_scores.float()) / (
+        query_states.shape[1] * num_query_heads * math.sqrt(head_dim)
+    )
+
+    keep = torch.ones(batch_size, prefix_len, dtype=torch.bool, device=key_states.device)
+    for start, end in visual_token_spans:
+        keep[:, start:end] = False
+        valid = attention_mask[:, :, start:end].any(dim=1)
+        for batch_idx in range(batch_size):
+            valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
+            if valid_indices.numel() == 0:
+                continue
+            count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
+            camera_scores = scores[batch_idx, start:end][valid_indices]
+            selected = valid_indices[torch.topk(camera_scores, count, sorted=False).indices] + start
+            keep[batch_idx, selected] = True
+
+    selected_counts = keep.sum(dim=1)
+    max_selected = int(selected_counts.max().item())
+    positions = torch.arange(prefix_len, device=key_states.device).expand(batch_size, -1)
+    selected_indices = torch.where(keep, positions, prefix_len).sort(dim=1).values[:, :max_selected]
+    selected_mask = torch.arange(max_selected, device=key_states.device)[None] < selected_counts[:, None]
+    selected_indices = torch.where(selected_mask, selected_indices, 0)
+
+    kv_indices = selected_indices[:, :, None, None].expand(-1, -1, num_key_value_heads, head_dim)
+    key_states = torch.gather(key_states, 1, kv_indices)
+    value_states = torch.gather(value_states, 1, kv_indices)
+    attention_mask = torch.gather(
+        attention_mask, 2, selected_indices[:, None].expand(-1, attention_mask.shape[1], -1)
+    )
+    attention_mask &= selected_mask[:, None]
+    return key_states, value_states, attention_mask
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -83,6 +130,8 @@ class SmolVLMWithExpertModel(nn.Module):
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
+        focus_token_keep_ratio: float = 1.0,
+        focus_token_start_layer: int = 8,
         device: str = "auto",
     ):
         super().__init__()
@@ -144,6 +193,8 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        self.focus_token_keep_ratio = focus_token_keep_ratio
+        self.focus_token_start_layer = focus_token_start_layer
         self.set_requires_grad()
 
     def get_vlm_model(self):
@@ -298,6 +349,7 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         past_key_values: "DynamicCache | None" = None,
+        visual_token_spans: tuple[tuple[int, int], ...] | None = None,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         attention_interface = self.get_attention_interface()
 
@@ -378,6 +430,20 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
+            if (
+                self.focus_token_keep_ratio < 1
+                and layer_idx >= self.focus_token_start_layer
+                and visual_token_spans
+            ):
+                expert_key_states, expert_value_states, expert_attention_mask = _select_visual_tokens(
+                    expert_query_states,
+                    expert_key_states,
+                    expert_value_states,
+                    expert_attention_mask,
+                    visual_token_spans,
+                    self.focus_token_keep_ratio,
+                )
+
             att_output = attention_interface(
                 expert_attention_mask,
                 batch_size,
@@ -414,6 +480,7 @@ class SmolVLMWithExpertModel(nn.Module):
         past_key_values: "DynamicCache | None" = None,
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
+        visual_token_spans: tuple[tuple[int, int], ...] | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -463,6 +530,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     past_key_values=past_key_values,
+                    visual_token_spans=visual_token_spans,
                 )
             outputs_embeds = []
             start = 0

@@ -503,6 +503,8 @@ class VLAFlowMatching(nn.Module):
             num_vlm_layers=self.config.num_vlm_layers,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
+            focus_token_keep_ratio=self.config.focus_token_keep_ratio,
+            focus_token_start_layer=self.config.focus_token_start_layer,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
@@ -551,13 +553,14 @@ class VLAFlowMatching(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[tuple[int, int], ...]]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         """
         embs = []
         pad_masks = []
         att_masks = []
+        visual_token_spans = []
         for _img_idx, (
             img,
             img_mask,
@@ -587,7 +590,9 @@ class VLAFlowMatching(nn.Module):
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
+            visual_start = sum(emb.shape[1] for emb in embs)
             embs.append(img_emb)
+            visual_token_spans.append((visual_start, visual_start + num_img_embs))
             pad_masks.append(img_mask)
 
             att_masks += [0] * (num_img_embs)
@@ -641,7 +646,7 @@ class VLAFlowMatching(nn.Module):
 
         att_masks = att_masks.expand(bsize, -1)
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, tuple(visual_token_spans)
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -699,7 +704,7 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, visual_token_spans = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -715,6 +720,7 @@ class VLAFlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
+            visual_token_spans=visual_token_spans,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -741,7 +747,7 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, visual_token_spans = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -762,6 +768,7 @@ class VLAFlowMatching(nn.Module):
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 timestep=current_timestep,
+                visual_token_spans=visual_token_spans,
             ),
             noise,
             num_steps,
@@ -778,6 +785,7 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        visual_token_spans,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -799,6 +807,7 @@ class VLAFlowMatching(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
+            visual_token_spans=visual_token_spans,
         )
         if past_key_values is not None:
             # Self-attention layers append suffix K/V in place; restore the prefix for the next step.

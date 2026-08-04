@@ -97,6 +97,10 @@ class SmolVLAConfig(PreTrainedConfig):
     self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
     expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
 
+    # Late action-aware visual token selection. A ratio of 1.0 preserves the dense baseline.
+    focus_token_keep_ratio: float = 1.0
+    focus_token_start_layer: int = 8
+
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
@@ -119,6 +123,23 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if not 0 < self.focus_token_keep_ratio <= 1:
+            raise ValueError("`focus_token_keep_ratio` must be in (0, 1].")
+        if not 0 <= self.focus_token_start_layer < self.num_vlm_layers:
+            raise ValueError("`focus_token_start_layer` must index a VLM layer.")
+        if self.focus_token_keep_ratio < 1:
+            if (
+                self.num_vlm_layers != 16
+                or self.num_expert_layers not in (-1, 16)
+                or self.attention_mode != "cross_attn"
+                or self.self_attn_every_n_layers != 2
+            ):
+                raise ValueError(
+                    "Focus-token experiments require 16 VLM/expert layers, cross_attn, and "
+                    "self_attn_every_n_layers=2."
+                )
+            if self.compile_model:
+                raise ValueError("Focus-token experiments require `compile_model=False`.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -55,3 +55,30 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`, see `pyproject.toml`). Guard optional imports with `TYPE_CHECKING or _foo_available` at module top + a `require_package(...)` check at use time. Reuse the `_foo_available` flags in `utils/import_utils.py`; don't call `is_package_available`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+
+## Hypothesis experiment workflow
+
+When the user requests the hypothesis experiment pipeline:
+
+1. Read `experiments/<experiment-id>/00_hypothesis.md`.
+2. Spawn `paper_researcher`.
+3. Spawn `reference_impl_reader` once candidate papers and repositories are known.
+   These two agents may run in parallel only when their inputs are already available.
+4. Wait for both agents and persist their outputs as:
+   - `01_literature_review.md`
+   - `02_implementation_map.md`
+5. As the primary orchestrator, create `03_experiment_plan.md`.
+   The plan must freeze metrics, seeds, budget, comparison conditions,
+   statistical tests, and falsification criteria.
+6. Ask for user approval before source-code changes.
+7. Spawn only `hypothesis_implementer` for implementation.
+   No other agent may edit source code concurrently.
+8. Review the diff and implementation tests.
+9. Spawn `paper_method_evaluator`.
+10. After raw results are complete, spawn `results_analyst`.
+11. Persist the final analysis as `06_analysis.md`.
+12. Report unsupported and inconclusive results as clearly as supported results.
+
+Never let multiple agents modify application source files concurrently.
+Never overwrite raw experiment results.
+Never alter the preregistered primary metric after observing results.
