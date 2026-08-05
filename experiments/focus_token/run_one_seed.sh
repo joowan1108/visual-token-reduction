@@ -61,7 +61,7 @@ for VARIANT in dense focus50 focus25 focus75; do
     continue
   fi
   [[ ! -e "$OUT" ]] || { echo "Refusing to overwrite incomplete run: $OUT" >&2; exit 1; }
-  mkdir -p "$OUT"
+  mkdir -p "$(dirname "$OUT")"
 
   lerobot-train \
     --policy.type=smolvla \
@@ -94,7 +94,7 @@ for VARIANT in dense focus50 focus25 focus75; do
     --wandb.enable=false \
     --output_dir="$OUT" \
     --job_name="focus_token_${VARIANT}_${SEED}" \
-    2>&1 | tee "$OUT/train.log"
+    2>&1 | tee "$(dirname "$OUT")/train.log"
 done
 
 for VARIANT in dense focus50 focus25 focus75; do

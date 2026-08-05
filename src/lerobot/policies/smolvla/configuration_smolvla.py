@@ -100,6 +100,7 @@ class SmolVLAConfig(PreTrainedConfig):
     # Late action-aware visual token selection. A ratio of 1.0 preserves the dense baseline.
     focus_token_keep_ratio: float = 1.0
     focus_token_start_layer: int = 8
+    focus_token_diagnostics_path: str | None = None
 
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0

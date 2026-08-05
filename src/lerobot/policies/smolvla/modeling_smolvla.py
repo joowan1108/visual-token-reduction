@@ -505,6 +505,7 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             focus_token_keep_ratio=self.config.focus_token_keep_ratio,
             focus_token_start_layer=self.config.focus_token_start_layer,
+            focus_token_diagnostics_path=self.config.focus_token_diagnostics_path,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
@@ -788,6 +789,12 @@ class VLAFlowMatching(nn.Module):
         visual_token_spans,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
+        if self.vlm_with_expert.focus_token_diagnostics_path is not None:
+            timestep_value = float(timestep[0].item())
+            self.vlm_with_expert.focus_token_diagnostics_context.update(
+                denoising_step=round((1.0 - timestep_value) * self.config.num_steps),
+                denoising_timestep=timestep_value,
+            )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]

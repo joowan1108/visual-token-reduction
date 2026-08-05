@@ -6,6 +6,10 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import json
+from contextlib import nullcontext
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +24,9 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
 
 
 def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape():
-    assert SmolVLAConfig().focus_token_keep_ratio == 1.0
+    config = SmolVLAConfig()
+    assert config.focus_token_keep_ratio == 1.0
+    assert config.focus_token_diagnostics_path is None
 
     with pytest.raises(ValueError, match="keep_ratio"):
         SmolVLAConfig(focus_token_keep_ratio=0)
@@ -37,8 +43,9 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
     mask = torch.ones(2, 1, 10, dtype=torch.bool)
     mask[1, :, 6:9] = False
 
+    diagnostics = []
     selected_keys, selected_values, selected_mask = _select_visual_tokens(
-        query, keys, values, mask, ((1, 5), (6, 9)), 0.5
+        query, keys, values, mask, ((1, 5), (6, 9)), 0.5, diagnostics
     )
 
     torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 3, 4, 5, 7, 8, 9.0]))
@@ -46,6 +53,15 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
     assert selected_mask[0, 0].tolist() == [True] * 7
     torch.testing.assert_close(selected_keys[1, :5, 0, 0], torch.tensor([0, 3, 4, 5, 9.0]))
     assert selected_mask[1, 0].tolist() == [True, True, True, True, True, False, False]
+    first_camera = diagnostics[0]
+    assert first_camera["valid_token_count"] == 4
+    assert first_camera["selected_token_count"] == 2
+    assert first_camera["selected_indices"] == [2, 3]
+    assert first_camera["selected_prefix_indices"] == [3, 4]
+    expected_mass = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0]), dim=0)[-2:].sum()
+    assert first_camera["topk_attention_mass"] == pytest.approx(expected_mass.item())
+    assert diagnostics[3]["valid_token_count"] == 0
+    assert diagnostics[3]["selected_indices"] == []
 
 
 class _FakeAttention:
@@ -147,3 +163,39 @@ def test_focus_token_layer_boundary_dense_identity_and_direct_cached_paths():
     actions.sum().backward()
     assert cached_suffix.grad is not None and torch.isfinite(cached_suffix.grad).all()
     assert all(layer.keys.shape[2] == 8 for layer in cache.layers)
+
+
+def test_focus_token_diagnostics_are_opt_in_jsonl(monkeypatch):
+    tmp_path = Path()
+    model, layers = _make_cross_attention_model()
+    prefix = torch.arange(32, dtype=torch.float32).view(1, 8, 4)
+    suffix = torch.ones(1, 3, 4)
+    path = tmp_path / "selection_metrics.jsonl"
+    output = StringIO()
+    monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: nullcontext(output))
+    model.get_attention_interface = lambda: model.eager_attention_forward
+    args = (
+        layers,
+        [prefix, suffix],
+        9,
+        torch.arange(11).unsqueeze(0),
+        torch.ones(1, 11, 11, dtype=torch.bool),
+        1,
+        2,
+    )
+
+    model.forward_cross_attn_layer(*args, use_cache=False, visual_token_spans=((0, 4), (4, 8)))
+    assert output.getvalue() == ""
+
+    model.enable_focus_token_diagnostics(path, frame=12, denoising_step=3)
+    model.forward_cross_attn_layer(*args, use_cache=False, visual_token_spans=((0, 4), (4, 8)))
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(records) == 2
+    assert records[0]["layer"] == 9
+    assert records[0]["camera"] == 0
+    assert records[0]["frame"] == 12
+    assert records[0]["denoising_step"] == 3
+    assert records[0]["valid_token_count"] == 4
+    assert records[0]["selected_token_count"] == 2
+    assert 0 < records[0]["topk_attention_mass"] <= 1

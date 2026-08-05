@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import copy
+import json
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,6 +81,7 @@ def _select_visual_tokens(
     attention_mask: torch.Tensor,
     visual_token_spans: tuple[tuple[int, int], ...],
     keep_ratio: float,
+    diagnostics: list[dict] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select visual K/V per camera and sample while retaining every non-visual position."""
     batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
@@ -89,17 +92,45 @@ def _select_visual_tokens(
     )
 
     keep = torch.ones(batch_size, prefix_len, dtype=torch.bool, device=key_states.device)
-    for start, end in visual_token_spans:
+    for camera_idx, (start, end) in enumerate(visual_token_spans):
         keep[:, start:end] = False
         valid = attention_mask[:, :, start:end].any(dim=1)
         for batch_idx in range(batch_size):
             valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
             if valid_indices.numel() == 0:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        {
+                            "batch_index": batch_idx,
+                            "camera": camera_idx,
+                            "valid_token_count": 0,
+                            "selected_token_count": 0,
+                            "selected_indices": [],
+                            "selected_prefix_indices": [],
+                            "topk_attention_mass": 0.0,
+                        }
+                    )
                 continue
             count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
             camera_scores = scores[batch_idx, start:end][valid_indices]
             selected = valid_indices[torch.topk(camera_scores, count, sorted=False).indices] + start
             keep[batch_idx, selected] = True
+            if diagnostics is not None:
+                selected = selected.sort().values
+                selected_in_valid = torch.isin(valid_indices + start, selected)
+                diagnostics.append(
+                    {
+                        "batch_index": batch_idx,
+                        "camera": camera_idx,
+                        "valid_token_count": int(valid_indices.numel()),
+                        "selected_token_count": count,
+                        "selected_indices": (selected - start).tolist(),
+                        "selected_prefix_indices": selected.tolist(),
+                        "topk_attention_mass": float(
+                            camera_scores.softmax(dim=0)[selected_in_valid].sum().item()
+                        ),
+                    }
+                )
 
     selected_counts = keep.sum(dim=1)
     max_selected = int(selected_counts.max().item())
@@ -132,6 +163,7 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_width_multiplier: float = 0.5,
         focus_token_keep_ratio: float = 1.0,
         focus_token_start_layer: int = 8,
+        focus_token_diagnostics_path: str | None = None,
         device: str = "auto",
     ):
         super().__init__()
@@ -195,7 +227,30 @@ class SmolVLMWithExpertModel(nn.Module):
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.focus_token_keep_ratio = focus_token_keep_ratio
         self.focus_token_start_layer = focus_token_start_layer
+        self.focus_token_diagnostics_path = None
+        self.focus_token_diagnostics_context = {}
+        if focus_token_diagnostics_path is not None:
+            self.enable_focus_token_diagnostics(focus_token_diagnostics_path)
         self.set_requires_grad()
+
+    def enable_focus_token_diagnostics(self, path, **context):
+        json.dumps(context)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.focus_token_diagnostics_path = path
+        self.focus_token_diagnostics_context = context
+
+    def disable_focus_token_diagnostics(self):
+        self.focus_token_diagnostics_path = None
+        self.focus_token_diagnostics_context = {}
+
+    def _write_focus_token_diagnostics(self, layer_idx, records):
+        with self.focus_token_diagnostics_path.open("a", encoding="utf-8") as output:
+            for record in records:
+                output.write(
+                    json.dumps({**self.focus_token_diagnostics_context, "layer": layer_idx, **record})
+                    + chr(10)
+                )
 
     def get_vlm_model(self):
         return self.vlm.model
@@ -435,6 +490,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 and layer_idx >= self.focus_token_start_layer
                 and visual_token_spans
             ):
+                diagnostics = [] if getattr(self, "focus_token_diagnostics_path", None) else None
                 expert_key_states, expert_value_states, expert_attention_mask = _select_visual_tokens(
                     expert_query_states,
                     expert_key_states,
@@ -442,7 +498,10 @@ class SmolVLMWithExpertModel(nn.Module):
                     expert_attention_mask,
                     visual_token_spans,
                     self.focus_token_keep_ratio,
+                    diagnostics,
                 )
+                if diagnostics:
+                    self._write_focus_token_diagnostics(layer_idx, diagnostics)
 
             att_output = attention_interface(
                 expert_attention_mask,
