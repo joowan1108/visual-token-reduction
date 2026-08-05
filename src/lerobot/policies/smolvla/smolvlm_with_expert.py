@@ -82,7 +82,7 @@ def _select_visual_tokens(
     visual_token_spans: tuple[tuple[int, int], ...],
     keep_ratio: float,
     diagnostics: list[dict] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select visual K/V per camera and sample while retaining every non-visual position."""
     batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
     num_query_heads = query_states.shape[2]
@@ -147,7 +147,7 @@ def _select_visual_tokens(
         attention_mask, 2, selected_indices[:, None].expand(-1, attention_mask.shape[1], -1)
     )
     attention_mask &= selected_mask[:, None]
-    return key_states, value_states, attention_mask
+    return key_states, value_states, attention_mask, selected_indices
 
 
 class SmolVLMWithExpertModel(nn.Module):
@@ -232,6 +232,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.focus_token_diagnostics_context = {}
         self.focus_token_diagnostics_call_index = 0
         self.focus_token_diagnostics_image_paths = {}
+        self._focus_token_attention_diagnostics = None
         if focus_token_diagnostics_path is not None:
             self.enable_focus_token_diagnostics(focus_token_diagnostics_path)
         self.set_requires_grad()
@@ -251,7 +252,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.focus_token_diagnostics_image_paths = {}
 
     def start_focus_token_diagnostics_call(self, images):
-        if self.focus_token_diagnostics_path is None or self.focus_token_keep_ratio >= 1:
+        if self.focus_token_diagnostics_path is None:
             return
 
         from PIL import Image
@@ -313,6 +314,27 @@ class SmolVLMWithExpertModel(nn.Module):
                     )
                     + chr(10)
                 )
+
+    def _capture_action_visual_attention(self, probs):
+        capture = getattr(self, "_focus_token_attention_diagnostics", None)
+        if capture is None:
+            return
+
+        visual_token_spans, original_prefix_indices, records = capture
+        action_attention = probs.detach().float().mean(dim=(1, 2))
+        for record in records:
+            batch_idx = record["batch_index"]
+            start, end = visual_token_spans[record["camera"]]
+            original_indices = original_prefix_indices[batch_idx]
+            is_camera_token = (original_indices >= start) & (original_indices < end)
+            distribution = torch.zeros(64, device=probs.device)
+            distribution.scatter_add_(
+                0,
+                original_indices[is_camera_token] - start,
+                action_attention[batch_idx, is_camera_token],
+            )
+            record["action_visual_attention_mass"] = float(distribution.sum().item())
+            record["action_visual_attention_distribution"] = distribution.tolist()
 
     def get_vlm_model(self):
         return self.vlm.model
@@ -553,7 +575,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 and visual_token_spans
             ):
                 diagnostics = [] if getattr(self, "focus_token_diagnostics_image_paths", None) else None
-                expert_key_states, expert_value_states, expert_attention_mask = _select_visual_tokens(
+                (
+                    expert_key_states,
+                    expert_value_states,
+                    expert_attention_mask,
+                    original_prefix_indices,
+                ) = _select_visual_tokens(
                     expert_query_states,
                     expert_key_states,
                     expert_value_states,
@@ -562,17 +589,51 @@ class SmolVLMWithExpertModel(nn.Module):
                     self.focus_token_keep_ratio,
                     diagnostics,
                 )
-                if diagnostics:
-                    self._write_focus_token_diagnostics(layer_idx, diagnostics)
+            else:
+                original_prefix_indices = torch.arange(
+                    expert_key_states.shape[1], device=expert_key_states.device
+                ).expand(batch_size, -1)
+                diagnostics = None
+                if (
+                    getattr(self, "focus_token_diagnostics_image_paths", None)
+                    and layer_idx >= self.focus_token_start_layer
+                    and visual_token_spans
+                ):
+                    diagnostics = []
+                    for camera_idx, (start, end) in enumerate(visual_token_spans):
+                        valid = expert_attention_mask[:, :, start:end].any(dim=1)
+                        for batch_idx in range(batch_size):
+                            selected = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
+                            diagnostics.append(
+                                {
+                                    "batch_index": batch_idx,
+                                    "camera": camera_idx,
+                                    "valid_token_count": int(selected.numel()),
+                                    "selected_token_count": int(selected.numel()),
+                                    "selected_indices": selected.tolist(),
+                                    "selected_prefix_indices": (selected + start).tolist(),
+                                }
+                            )
 
-            att_output = attention_interface(
-                expert_attention_mask,
-                batch_size,
-                head_dim,
-                expert_query_states,
-                expert_key_states,
-                expert_value_states,
-            )
+            if diagnostics:
+                self._focus_token_attention_diagnostics = (
+                    visual_token_spans,
+                    original_prefix_indices,
+                    diagnostics,
+                )
+            try:
+                att_output = attention_interface(
+                    expert_attention_mask,
+                    batch_size,
+                    head_dim,
+                    expert_query_states,
+                    expert_key_states,
+                    expert_value_states,
+                )
+            finally:
+                self._focus_token_attention_diagnostics = None
+            if diagnostics:
+                self._write_focus_token_diagnostics(layer_idx, diagnostics)
             att_outputs.append(att_output)
         else:
             att_outputs.append(None)
@@ -739,6 +800,7 @@ class SmolVLMWithExpertModel(nn.Module):
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
         probs = probs.to(dtype=value_states.dtype)
+        self._capture_action_visual_attention(probs)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
 

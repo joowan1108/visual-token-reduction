@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from torch import nn
 
+from experiments.focus_token.visualize_focus_tokens import render_composites, render_overlays
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMWithExpertModel,
@@ -46,12 +47,13 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
     mask[1, :, 6:9] = False
 
     diagnostics = []
-    selected_keys, selected_values, selected_mask = _select_visual_tokens(
+    selected_keys, selected_values, selected_mask, original_indices = _select_visual_tokens(
         query, keys, values, mask, ((1, 5), (6, 9)), 0.5, diagnostics
     )
 
     torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 3, 4, 5, 8, 9.0]))
     torch.testing.assert_close(selected_values, selected_keys)
+    assert original_indices[0].tolist() == [0, 3, 4, 5, 8, 9]
     assert selected_mask[0, 0].tolist() == [True] * 6
     torch.testing.assert_close(selected_keys[1, :5, 0, 0], torch.tensor([0, 3, 4, 5, 9.0]))
     assert selected_mask[1, 0].tolist() == [True, True, True, True, True, False]
@@ -224,5 +226,71 @@ def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypa
     assert records[0]["valid_token_count"] == 4
     assert records[0]["selected_token_count"] == 2
     assert 0 < records[0]["topk_attention_mass"] <= 1
+    assert len(records[0]["action_visual_attention_distribution"]) == 64
+    assert records[0]["action_visual_attention_mass"] == pytest.approx(
+        sum(records[0]["action_visual_attention_distribution"])
+    )
+    assert records[0]["action_visual_attention_mass"] + records[1][
+        "action_visual_attention_mass"
+    ] == pytest.approx(1.0)
+    assert all(
+        value == 0
+        for index, value in enumerate(records[0]["action_visual_attention_distribution"])
+        if index not in records[0]["selected_indices"]
+    )
     assert saved_images[Path(records[0]["image_path"])].getpixel((0, 0)) == (0, 0, 0)
     assert saved_images[Path(records[1]["image_path"])].getpixel((0, 0)) == (128, 128, 128)
+
+    output.seek(0)
+    output.truncate()
+    model.focus_token_keep_ratio = 1.0
+    model.enable_focus_token_diagnostics(path, frame=12, denoising_step=3)
+    model.start_focus_token_diagnostics_call(images)
+    model.forward_cross_attn_layer(*args, use_cache=False, visual_token_spans=((0, 4), (4, 8)))
+    model.end_focus_token_diagnostics_call()
+
+    dense_records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(dense_records) == 2
+    assert dense_records[0]["selected_indices"] == [0, 1, 2, 3]
+    assert len(dense_records[0]["action_visual_attention_distribution"]) == 64
+    assert dense_records[0]["action_visual_attention_mass"] + dense_records[1][
+        "action_visual_attention_mass"
+    ] == pytest.approx(1.0)
+
+
+def test_focus_token_visualizers_preserve_selector_overlays_and_render_smooth_composite(tmp_path):
+    image_path = tmp_path / "camera.png"
+    Image.new("RGB", (32, 32), "black").save(image_path)
+    records = []
+    for layer in (9, 11, 13, 15):
+        for camera in (0, 1):
+            selector_distribution = [0.0] * 64
+            selector_distribution[0] = 1.0
+            action_distribution = [0.0] * 64
+            action_distribution[camera] = 0.25
+            records.append(
+                {
+                    "call_index": 0,
+                    "batch_index": 0,
+                    "camera": camera,
+                    "layer": layer,
+                    "denoising_step": 9,
+                    "image_path": str(image_path),
+                    "selected_indices": [0],
+                    "attention_distribution": selector_distribution,
+                    "action_visual_attention_mass": 0.25,
+                    "action_visual_attention_distribution": action_distribution,
+                }
+            )
+    jsonl_path = tmp_path / "attention.jsonl"
+    jsonl_path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    overlay_dir = tmp_path / "overlays"
+    assert render_overlays(jsonl_path, overlay_dir) == 8
+    assert len(list(overlay_dir.glob("*.png"))) == 8
+
+    composite_dir = tmp_path / "composites"
+    assert render_composites(jsonl_path, composite_dir) == 1
+    with Image.open(next(composite_dir.glob("*.png"))) as composite:
+        panel = composite.crop((0, 24, 32, 56))
+        assert len(panel.getcolors(maxcolors=32 * 32)) > 8

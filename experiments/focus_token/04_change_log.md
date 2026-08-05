@@ -197,3 +197,49 @@ git diff --check
 - Each camera span is one spatial patch grid. The visualization fails explicitly for non-square counts rather than guessing a layout.
 - The PNG is a faithful display conversion of the tensor presented to the vision encoder, including resize padding; PNG encoding does not feed back into inference.
 - The overlay is post-hoc diagnostics only. It is not part of FocusVLA or the preregistered intervention and does not change selection, training, evaluation, or statistical analysis.
+
+## Exact expert-attention heatmaps addendum (2026-08-05)
+
+### Changed files and configuration
+
+- src/lerobot/policies/smolvla/smolvlm_with_expert.py
+  - Diagnostics now capture the post-mask, post-softmax, post-dtype-cast probabilities used by expert cross-attention.
+  - Probabilities are averaged over expert heads and action query tokens, then scattered through the gathered-to-original prefix map into action_visual_attention_mass and a 64-value action_visual_attention_distribution per camera. Sparse unselected locations are zero.
+  - Opt-in diagnostics now also work with focus_token_keep_ratio=1.0; normal dense and sparse paths remain unchanged when focus_token_diagnostics_path=None.
+- tests/policies/smolvla/test_focus_token.py
+  - Covers sparse original-index remapping, 64-value exact-attention output, zero unselected locations, camera-mass conservation, and dense diagnostics.
+- experiments/focus_token/visualize_focus_tokens.py
+  - Preserves the original selector-score render_overlays API and default CLI behavior; --composite renders smoothly interpolated inferno heatmaps of actual expert attention in a 4-layer by 2-camera layout.
+- experiments/focus_token/run_attention_heatmaps.sh
+  - Runs the Dense Hub checkpoint and latest local Focus50 seed1000 checkpoint 050000 with identical LIBERO suite/task/episode settings and refuses to reuse an output path.
+  - Runs each suite in a separate evaluator process and diagnostics JSONL, so each variant produces three first-call composites per suite (12 total) for paired environment seeds 0, 1, and 2.
+
+No dependency, trainable parameter, checkpoint key, training behavior, metric, dataset, seed, primary budget, or evaluation criterion changed. Diagnostics remain disabled by default.
+
+One-line remote invocation:
+
+    bash experiments/focus_token/run_attention_heatmaps.sh
+
+The runner freezes the requested diagnostic comparison settings: Dense sungkyunner/smolvla_libero_baseline; Focus50 seed1000 checkpoint 050000; suites libero_10, libero_object, libero_goal, and libero_spatial; task id 0; n_episodes=batch_size=3; seed 0; LIBERO stored initial states; no recording. FOCUS_CHECKPOINT, FOCUS_SEARCH_ROOT, and OUT only locate inputs/outputs and do not change evaluation semantics.
+
+### Verification
+
+    python -S -m py_compile src/lerobot/policies/smolvla/smolvlm_with_expert.py tests/policies/smolvla/test_focus_token.py experiments/focus_token/visualize_focus_tokens.py
+    # passed
+
+    ruff format --check src/lerobot/policies/smolvla/smolvlm_with_expert.py tests/policies/smolvla/test_focus_token.py experiments/focus_token/visualize_focus_tokens.py
+    # 3 files already formatted
+
+    ruff check src/lerobot/policies/smolvla/smolvlm_with_expert.py tests/policies/smolvla/test_focus_token.py experiments/focus_token/visualize_focus_tokens.py
+    # All checks passed!
+
+    git diff --check
+    # passed; only existing LF-to-CRLF warnings were emitted
+Two CPU pytest attempts produced no output and stalled during Python/Torch startup; they were terminated without a test result. No GPU or LIBERO command was run. WSL bash -n was unavailable on this Windows host (E_ACCESSDENIED), so the Linux runner was not executed locally.
+
+### Assumptions and paper deviations
+
+- SmolVLA supplies 64 visual patch tokens per camera; diagnostics intentionally serialize a fixed 8x8 grid.
+- Head/query aggregation is the arithmetic mean, so camera masses remain fractions of total attention and the per-camera distribution sums to its reported mass.
+- Identical evaluator seed, stored LIBERO initial states, task id, episode count, and batch size reproduce the same initial observations for the two separately seeded evaluator processes.
+- These heatmaps and the small four-suite diagnostic rollout are post-hoc inspection only, not a new intervention or a replacement for the preregistered evaluation. There is no paper-method change.
