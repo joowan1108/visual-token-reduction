@@ -762,23 +762,26 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
         )
         num_steps = self.config.num_steps
-
-        return euler_integrate(
-            lambda input_x_t, current_timestep: self.denoise_step(
-                x_t=input_x_t,
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                timestep=current_timestep,
-                visual_token_spans=visual_token_spans,
-            ),
-            noise,
-            num_steps,
-            rtc_processor=self.rtc_processor,
-            rtc_enabled=self._rtc_enabled(),
-            inference_delay=kwargs.get("inference_delay"),
-            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
-            execution_horizon=kwargs.get("execution_horizon"),
-        )
+        self.vlm_with_expert.start_focus_token_diagnostics_call(images)
+        try:
+            return euler_integrate(
+                lambda input_x_t, current_timestep: self.denoise_step(
+                    x_t=input_x_t,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    timestep=current_timestep,
+                    visual_token_spans=visual_token_spans,
+                ),
+                noise,
+                num_steps,
+                rtc_processor=self.rtc_processor,
+                rtc_enabled=self._rtc_enabled(),
+                inference_delay=kwargs.get("inference_delay"),
+                prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+                execution_horizon=kwargs.get("execution_horizon"),
+            )
+        finally:
+            self.vlm_with_expert.end_focus_token_diagnostics_call()
 
     def denoise_step(
         self,

@@ -107,6 +107,7 @@ def _select_visual_tokens(
                             "selected_token_count": 0,
                             "selected_indices": [],
                             "selected_prefix_indices": [],
+                            "attention_distribution": [0.0] * (end - start),
                             "topk_attention_mass": 0.0,
                         }
                     )
@@ -117,7 +118,8 @@ def _select_visual_tokens(
             keep[batch_idx, selected] = True
             if diagnostics is not None:
                 selected = selected.sort().values
-                selected_in_valid = torch.isin(valid_indices + start, selected)
+                attention_distribution = torch.zeros(end - start, device=camera_scores.device)
+                attention_distribution[valid_indices] = camera_scores.softmax(dim=0)
                 diagnostics.append(
                     {
                         "batch_index": batch_idx,
@@ -126,9 +128,8 @@ def _select_visual_tokens(
                         "selected_token_count": count,
                         "selected_indices": (selected - start).tolist(),
                         "selected_prefix_indices": selected.tolist(),
-                        "topk_attention_mass": float(
-                            camera_scores.softmax(dim=0)[selected_in_valid].sum().item()
-                        ),
+                        "attention_distribution": attention_distribution.tolist(),
+                        "topk_attention_mass": float(attention_distribution[selected - start].sum().item()),
                     }
                 )
 
@@ -229,6 +230,8 @@ class SmolVLMWithExpertModel(nn.Module):
         self.focus_token_start_layer = focus_token_start_layer
         self.focus_token_diagnostics_path = None
         self.focus_token_diagnostics_context = {}
+        self.focus_token_diagnostics_call_index = 0
+        self.focus_token_diagnostics_image_paths = {}
         if focus_token_diagnostics_path is not None:
             self.enable_focus_token_diagnostics(focus_token_diagnostics_path)
         self.set_requires_grad()
@@ -239,16 +242,75 @@ class SmolVLMWithExpertModel(nn.Module):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.focus_token_diagnostics_path = path
         self.focus_token_diagnostics_context = context
+        self.focus_token_diagnostics_call_index = 0
+        self.focus_token_diagnostics_image_paths = {}
 
     def disable_focus_token_diagnostics(self):
         self.focus_token_diagnostics_path = None
         self.focus_token_diagnostics_context = {}
+        self.focus_token_diagnostics_image_paths = {}
+
+    def start_focus_token_diagnostics_call(self, images):
+        if self.focus_token_diagnostics_path is None or self.focus_token_keep_ratio >= 1:
+            return
+
+        from PIL import Image
+
+        call_index = self.focus_token_diagnostics_call_index
+        image_dir = (
+            self.focus_token_diagnostics_path.parent / f"{self.focus_token_diagnostics_path.stem}_images"
+        )
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_paths = {}
+        batch_size = images[0].shape[0]
+        for camera_idx, camera_images in enumerate(images):
+            if camera_images.ndim != 4 or camera_images.shape[0] != batch_size or camera_images.shape[1] != 3:
+                raise ValueError(
+                    f"Expected model-input RGB images shaped (batch,3,height,width), got {camera_images.shape}"
+                )
+            camera_images = camera_images.detach().float().cpu()
+            if (
+                not torch.isfinite(camera_images).all()
+                or camera_images.min() < -1.0001
+                or camera_images.max() > 1.0001
+            ):
+                raise ValueError("Expected finite model-input image values in [-1, 1].")
+            camera_images = ((camera_images + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
+            for batch_idx, image in enumerate(camera_images):
+                image_path = image_dir / (
+                    f"call_{call_index:06d}_batch_{batch_idx:03d}_camera_{camera_idx:02d}.png"
+                )
+                if image_path.exists():
+                    raise FileExistsError(f"Refusing to overwrite diagnostic image: {image_path}")
+                height, width = image.shape[1:]
+                Image.frombytes(
+                    "RGB", (width, height), image.permute(1, 2, 0).contiguous().numpy().tobytes()
+                ).save(image_path)
+                image_paths[(batch_idx, camera_idx)] = image_path.relative_to(
+                    self.focus_token_diagnostics_path.parent
+                ).as_posix()
+        self.focus_token_diagnostics_context["call_index"] = call_index
+        self.focus_token_diagnostics_image_paths = image_paths
+        self.focus_token_diagnostics_call_index += 1
+
+    def end_focus_token_diagnostics_call(self):
+        self.focus_token_diagnostics_image_paths = {}
 
     def _write_focus_token_diagnostics(self, layer_idx, records):
         with self.focus_token_diagnostics_path.open("a", encoding="utf-8") as output:
             for record in records:
+                image_path = self.focus_token_diagnostics_image_paths[
+                    (record["batch_index"], record["camera"])
+                ]
                 output.write(
-                    json.dumps({**self.focus_token_diagnostics_context, "layer": layer_idx, **record})
+                    json.dumps(
+                        {
+                            **self.focus_token_diagnostics_context,
+                            "layer": layer_idx,
+                            "image_path": image_path,
+                            **record,
+                        }
+                    )
                     + chr(10)
                 )
 
@@ -490,7 +552,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 and layer_idx >= self.focus_token_start_layer
                 and visual_token_spans
             ):
-                diagnostics = [] if getattr(self, "focus_token_diagnostics_path", None) else None
+                diagnostics = [] if getattr(self, "focus_token_diagnostics_image_paths", None) else None
                 expert_key_states, expert_value_states, expert_attention_mask = _select_visual_tokens(
                     expert_query_states,
                     expert_key_states,
