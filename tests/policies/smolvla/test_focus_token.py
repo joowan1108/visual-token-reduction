@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 from torch import nn
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -41,6 +42,7 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
     keys = torch.arange(10, dtype=torch.float32).view(1, 10, 1, 1).expand(2, -1, -1, -1)
     values = keys.clone()
     mask = torch.ones(2, 1, 10, dtype=torch.bool)
+    mask[0, :, 6] = False
     mask[1, :, 6:9] = False
 
     diagnostics = []
@@ -48,20 +50,28 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
         query, keys, values, mask, ((1, 5), (6, 9)), 0.5, diagnostics
     )
 
-    torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 3, 4, 5, 7, 8, 9.0]))
+    torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 3, 4, 5, 8, 9.0]))
     torch.testing.assert_close(selected_values, selected_keys)
-    assert selected_mask[0, 0].tolist() == [True] * 7
+    assert selected_mask[0, 0].tolist() == [True] * 6
     torch.testing.assert_close(selected_keys[1, :5, 0, 0], torch.tensor([0, 3, 4, 5, 9.0]))
-    assert selected_mask[1, 0].tolist() == [True, True, True, True, True, False, False]
+    assert selected_mask[1, 0].tolist() == [True, True, True, True, True, False]
     first_camera = diagnostics[0]
     assert first_camera["valid_token_count"] == 4
     assert first_camera["selected_token_count"] == 2
     assert first_camera["selected_indices"] == [2, 3]
     assert first_camera["selected_prefix_indices"] == [3, 4]
+    expected_distribution = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0]), dim=0)
+    torch.testing.assert_close(torch.tensor(first_camera["attention_distribution"]), expected_distribution)
     expected_mass = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0]), dim=0)[-2:].sum()
     assert first_camera["topk_attention_mass"] == pytest.approx(expected_mass.item())
+    assert first_camera["topk_attention_mass"] == pytest.approx(
+        sum(first_camera["attention_distribution"][index] for index in first_camera["selected_indices"])
+    )
+    assert diagnostics[2]["attention_distribution"][0] == 0.0
+    assert sum(diagnostics[2]["attention_distribution"]) == pytest.approx(1.0)
     assert diagnostics[3]["valid_token_count"] == 0
     assert diagnostics[3]["selected_indices"] == []
+    assert diagnostics[3]["attention_distribution"] == [0.0, 0.0, 0.0]
 
 
 class _FakeAttention:
@@ -165,15 +175,19 @@ def test_focus_token_layer_boundary_dense_identity_and_direct_cached_paths():
     assert all(layer.keys.shape[2] == 8 for layer in cache.layers)
 
 
-def test_focus_token_diagnostics_are_opt_in_jsonl(monkeypatch):
-    tmp_path = Path()
+def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypatch):
     model, layers = _make_cross_attention_model()
     prefix = torch.arange(32, dtype=torch.float32).view(1, 8, 4)
     suffix = torch.ones(1, 3, 4)
-    path = tmp_path / "selection_metrics.jsonl"
+    path = Path("selection_metrics.jsonl")
     output = StringIO()
+    saved_images = {}
     monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(Path, "exists", lambda *args, **kwargs: False)
     monkeypatch.setattr(Path, "open", lambda *args, **kwargs: nullcontext(output))
+    monkeypatch.setattr(
+        Image.Image, "save", lambda image, image_path: saved_images.setdefault(image_path, image)
+    )
     model.get_attention_interface = lambda: model.eager_attention_forward
     args = (
         layers,
@@ -189,13 +203,26 @@ def test_focus_token_diagnostics_are_opt_in_jsonl(monkeypatch):
     assert output.getvalue() == ""
 
     model.enable_focus_token_diagnostics(path, frame=12, denoising_step=3)
+    images = [torch.full((1, 3, 2, 2), -1.0), torch.zeros(1, 3, 2, 2)]
+    model.start_focus_token_diagnostics_call(images)
     model.forward_cross_attn_layer(*args, use_cache=False, visual_token_spans=((0, 4), (4, 8)))
+    model.end_focus_token_diagnostics_call()
+    model.start_focus_token_diagnostics_call(images)
+    model.forward_cross_attn_layer(*args, use_cache=False, visual_token_spans=((0, 4), (4, 8)))
+    model.end_focus_token_diagnostics_call()
+
     records = [json.loads(line) for line in output.getvalue().splitlines()]
-    assert len(records) == 2
+    assert len(records) == 4
     assert records[0]["layer"] == 9
     assert records[0]["camera"] == 0
     assert records[0]["frame"] == 12
     assert records[0]["denoising_step"] == 3
+    assert records[0]["call_index"] == 0
+    assert records[2]["call_index"] == 1
+    assert records[0]["image_path"] != records[1]["image_path"]
+    assert records[0]["image_path"] != records[2]["image_path"]
     assert records[0]["valid_token_count"] == 4
     assert records[0]["selected_token_count"] == 2
     assert 0 < records[0]["topk_attention_mass"] <= 1
+    assert saved_images[Path(records[0]["image_path"])].getpixel((0, 0)) == (0, 0, 0)
+    assert saved_images[Path(records[1]["image_path"])].getpixel((0, 0)) == (128, 128, 128)

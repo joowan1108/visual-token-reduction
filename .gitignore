@@ -176,3 +176,10 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+
+set -euo pipefail; export MUJOCO_GL=egl; FOCUS_POLICY="여기에_Focus50_100K_경로/checkpoints/100000/pretrained_model"; OUT="experiments/focus_token/results/focus50_100k_diagnostics"; test -d
+  "$FOCUS_POLICY" || { echo "Missing checkpoint: $FOCUS_POLICY" >&2; exit 1; }; mkdir -p "$OUT"; uv run --locked --extra test --extra libero lerobot-eval --policy.path="$FOCUS_POLICY"
+  --policy.device=cuda --policy.use_amp=false --policy.focus_token_diagnostics_path="$OUT/selection_metrics.jsonl" --env.type=libero --env.task=libero_10 --env.task_ids='[0]'
+  --env.control_mode=relative --env.init_states=true --env.hard_reset=true --env.max_parallel_tasks=1 --eval.n_episodes=1 --eval.batch_size=1 --eval.recording=false --seed=0
+  --output_dir="$OUT/eval" --job_name="focus50_100k_attention_diagnostic" 2>&1 | tee "$OUT/eval.log"

@@ -144,3 +144,56 @@ Commands and results:
     # passed
 
 The Conda environment does not contain the Ruff module, so the already-installed standalone Ruff executable performed the read-only lint and format checks. This does not change the experiment dependency environment. There is no paper-method deviation from this retry, and metrics, datasets, seeds, budgets, and evaluation criteria remain unchanged.
+
+## Inference diagnostics and visualization addendum (2026-08-05)
+
+### Scope and changed files
+
+- `src/lerobot/policies/smolvla/modeling_smolvla.py`
+  - Starts one diagnostics context per inference action-chunk call and clears it after Euler integration.
+  - Passes the exact post-resize/pad, SigLIP-range `[-1, 1]` camera tensors already consumed by the model to the opt-in diagnostics saver. Inference tensors are not modified.
+- `src/lerobot/policies/smolvla/smolvlm_with_expert.py`
+  - Saves one RGB PNG per call, batch item, and camera, and adds `call_index` plus the matching relative `image_path` to every emitted JSONL record.
+  - Validates RGB NCHW shape, a shared batch size, finite values, and the `[-1, 1]` model-input range before converting with `round((x + 1) * 127.5)` to uint8.
+  - Serializes the full camera-span softmax as `attention_distribution`; invalid positions are zero. `topk_attention_mass` is computed by summing that serialized distribution at `selected_indices`.
+  - Refuses to overwrite an existing diagnostic PNG. Dense/default mode does not create diagnostic images.
+- `experiments/focus_token/visualize_focus_tokens.py`
+  - Adds a stdlib plus Pillow CLI that reads the JSONL-relative source images, validates a non-empty square patch grid (`64` tokens resolve to `8x8`), draws a transparent attention heatmap, and outlines selected patches.
+  - Refuses to overwrite an existing overlay.
+- `tests/policies/smolvla/test_focus_token.py`
+  - Adds focused checks for the full distribution, partially and fully invalid positions, top-k mass equality, opt-in behavior, call/image alignment, and `[-1, 1]` to uint8 conversion.
+
+No configuration field, dependency, checkpoint weight, trainable parameter, training path, metric, dataset, seed, budget, or evaluation criterion changed. `policy.focus_token_diagnostics_path` remains opt-in with default `None`; setting it to a JSONL path enables these evaluation diagnostics for sparse Focus variants.
+
+Visualization command:
+
+```powershell
+C:\Users\joowa\miniconda3\envs\test\python.exe experiments/focus_token/visualize_focus_tokens.py <diagnostics.jsonl> --output-dir <overlay-directory>
+```
+
+### Verification commands and results
+
+```powershell
+C:\Users\joowa\miniconda3\envs\test\python.exe -m pytest -q -p no:cacheprovider tests/policies/smolvla/test_focus_token.py
+# 4 passed in 5.88s
+
+C:\Users\joowa\AppData\Local\Programs\Python\Python310\Scripts\ruff.exe check src/lerobot/policies/smolvla/modeling_smolvla.py src/lerobot/policies/smolvla/smolvlm_with_expert.py tests/policies/smolvla/test_focus_token.py experiments/focus_token/visualize_focus_tokens.py
+# All checks passed!
+
+C:\Users\joowa\AppData\Local\Programs\Python\Python310\Scripts\ruff.exe format --check src/lerobot/policies/smolvla/modeling_smolvla.py src/lerobot/policies/smolvla/smolvlm_with_expert.py tests/policies/smolvla/test_focus_token.py experiments/focus_token/visualize_focus_tokens.py
+# 4 files already formatted
+
+$env:PYTHONDONTWRITEBYTECODE='1'
+C:\Users\joowa\miniconda3\envs\test\python.exe experiments/focus_token/visualize_focus_tokens.py --help
+# passed
+
+git diff --check
+# passed (only the existing Windows LF-to-CRLF warning was emitted)
+```
+
+### Assumptions and paper deviations
+
+- Camera order is the existing `images` list order, which is also the order used to build the visual-token spans; `camera` therefore aligns the saved PNG with the corresponding distribution.
+- Each camera span is one spatial patch grid. The visualization fails explicitly for non-square counts rather than guessing a layout.
+- The PNG is a faithful display conversion of the tensor presented to the vision encoder, including resize padding; PNG encoding does not feed back into inference.
+- The overlay is post-hoc diagnostics only. It is not part of FocusVLA or the preregistered intervention and does not change selection, training, evaluation, or statistical analysis.
