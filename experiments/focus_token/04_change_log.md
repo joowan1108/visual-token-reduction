@@ -243,3 +243,57 @@ Two CPU pytest attempts produced no output and stalled during Python/Torch start
 - Head/query aggregation is the arithmetic mean, so camera masses remain fractions of total attention and the per-camera distribution sums to its reported mass.
 - Identical evaluator seed, stored LIBERO initial states, task id, episode count, and batch size reproduce the same initial observations for the two separately seeded evaluator processes.
 - These heatmaps and the small four-suite diagnostic rollout are post-hoc inspection only, not a new intervention or a replacement for the preregistered evaluation. There is no paper-method change.
+
+## Cascaded Focus Attention amendment implementation (2026-08-07)
+
+Implemented the user-approved `03_amendment_02_cascaded_focus.md` as a separate opt-in path.
+
+- `configuration_smolvla.py` adds `focus_cascaded_attention=False` and
+  `focus_channel_gate=False`. Gate without cascaded attention is rejected. Existing Dense and legacy
+  Focus configs retain their exact defaults and module layout.
+- `modeling_smolvla.py` passes the two options to the expert model; preprocessing, flow matching,
+  denoising, cache construction, and checkpoint defaults are unchanged.
+- `smolvlm_with_expert.py` splits each opt-in expert cross-attention into independently normalized
+  nonvisual-condition and visual branches. The visual branch uses head-averaged scaled QK logits and
+  an exact per-action-query global Top-K mask across all cameras. An optional sigmoid element-wise
+  gate modulates visual output before a trainable fusion projection combines both branches.
+- The initial implementation intentionally retains dense visual K/V tensors and applies the Top-K as
+  an attention mask. This matches the amendment's accuracy-first screening scope and makes no FLOP
+  reduction claim.
+- Diagnostics record per-patch query selection frequency, retained selector mass, actual visual
+  attention, and gate statistics without changing inference tensors.
+- `visualize_focus_tokens.py --composite` retains its CLI and now creates one reference-style image
+  per batch/layer: two camera columns and three rows containing original observations, blockwise
+  Top-K selections, and bicubic-smoothed action-to-visual heatmaps with attention-mass labels.
+- `test_focus_token.py` adds config validation, exact per-query global budgets with different query
+  selections, branch masks, gate range/shape, gate/fusion gradients, and the new composite layout.
+
+Verification in the current WSL session:
+
+```text
+python3 -m py_compile <five changed Python files>
+# passed
+
+git diff --check -- <five changed Python files>
+# passed
+```
+
+`uv` is not installed in this WSL environment, Linux Python lacks Torch/Pillow, and WSL-to-Windows
+process interop failed with `UtilBindVsockAnyPort: socket failed 1`; therefore pytest and Ruff could
+not run here. No raw result, dependency, or unrelated untracked file was modified.
+
+## Cascaded Focus evaluator follow-up (2026-08-07)
+
+- Replaced the single linear channel gate with the approved minimal
+  `Linear -> SiLU -> Linear -> sigmoid` path. The final bias is 2.0 and its weights use a small
+  initialization, so gates start near open without being constant.
+- Cascaded JSONL now marks `action_visual_attention_scope="visual_branch"` and records the distinct
+  `visual_branch_camera_attention_share`. Dense and legacy Focus records use `total_prefix` and
+  `total_prefix_camera_attention_mass`. The legacy `action_visual_attention_mass` remains for old
+  readers, but composite labels state the correct semantics.
+- Eager attention now explicitly zeros masked post-softmax probabilities, including fully invalid
+  queries. Tests cover exact per-query ceil budgets with different valid counts, masked probability
+  zero, fully invalid zero output, condition-padding invariance, and both gate-layer gradients.
+- The requested 3-row by 2-camera composite remains. Its two camera heatmaps share one scale within
+  each batch/layer image; the label explicitly calls this camera-relative, so it is not evidence for
+  cross-layer or cross-variant intensity differences.

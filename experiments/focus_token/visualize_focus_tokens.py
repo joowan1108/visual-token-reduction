@@ -11,6 +11,7 @@ LAYERS = (9, 11, 13, 15)
 CAMERAS = (0, 1)
 GRID_SIZE = 8
 LABEL_HEIGHT = 24
+TITLE_HEIGHT = 32
 INFERNO_STOPS = (
     (0.0, (0, 0, 4)),
     (0.25, (87, 16, 110)),
@@ -106,7 +107,7 @@ def render_overlays(jsonl_path: Path, output_dir: Path) -> int:
     return rendered
 
 
-def _actual_attention_overlay(record: dict, jsonl_path: Path) -> Image.Image:
+def _actual_attention_overlay(record: dict, jsonl_path: Path, peak: float | None = None) -> Image.Image:
     distribution = record["action_visual_attention_distribution"]
     if len(distribution) != GRID_SIZE**2:
         raise ValueError(f"Expected 64 attention values, got {len(distribution)}")
@@ -119,7 +120,7 @@ def _actual_attention_overlay(record: dict, jsonl_path: Path) -> Image.Image:
     with Image.open(image_path) as image:
         source = image.convert("RGBA")
 
-    peak = max(distribution)
+    peak = max(distribution) if peak is None else peak
     if not peak:
         return source.convert("RGB")
     normalized = Image.new("L", (GRID_SIZE, GRID_SIZE))
@@ -132,8 +133,42 @@ def _actual_attention_overlay(record: dict, jsonl_path: Path) -> Image.Image:
     return Image.alpha_composite(source, heatmap).convert("RGB")
 
 
+def _source_image(record: dict, jsonl_path: Path) -> Image.Image:
+    image_path = Path(record["image_path"])
+    if not image_path.is_absolute():
+        image_path = jsonl_path.parent / image_path
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
+
+
+def _selection_overlay(record: dict, jsonl_path: Path) -> Image.Image:
+    source = _source_image(record, jsonl_path).convert("RGBA")
+    distribution = record["attention_distribution"]
+    grid_size = math.isqrt(len(distribution))
+    if not distribution or grid_size * grid_size != len(distribution):
+        raise ValueError(f"Expected a square selection grid, got {len(distribution)} values")
+    overlay = Image.new("RGBA", source.size, (0, 0, 0, 170))
+    draw = ImageDraw.Draw(overlay)
+    width, height = source.size
+    for index, frequency in enumerate(distribution):
+        if not math.isfinite(frequency) or not 0 <= frequency <= 1:
+            raise ValueError("Selection frequencies must be finite values in [0, 1]")
+        row, column = divmod(index, grid_size)
+        color = (255, 244, 164, 190) if frequency >= 0.75 else (190, 55, 130, round(190 * frequency))
+        draw.rectangle(
+            (
+                column * width // grid_size,
+                row * height // grid_size,
+                (column + 1) * width // grid_size,
+                (row + 1) * height // grid_size,
+            ),
+            fill=color,
+        )
+    return Image.alpha_composite(source, overlay).convert("RGB")
+
+
 def render_composites(jsonl_path: Path, output_dir: Path) -> int:
-    """Render actual expert-attention composites for the first call's final denoising step."""
+    """Render first-call final-step originals, Top-K masks, and expert-attention heatmaps."""
     records = [
         json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
@@ -169,36 +204,60 @@ def render_composites(jsonl_path: Path, output_dir: Path) -> int:
         if missing:
             raise ValueError(f"Missing batch {batch_index} diagnostics: {missing}")
 
-        panels = {
-            (layer, camera): _actual_attention_overlay(by_batch[(batch_index, layer, camera)], jsonl_path)
-            for layer in LAYERS
-            for camera in CAMERAS
-        }
-        panel_width, panel_height = panels[(LAYERS[0], CAMERAS[0])].size
-        if any(panel.size != (panel_width, panel_height) for panel in panels.values()):
-            raise ValueError("All camera images must have the same dimensions")
-        composite = Image.new(
-            "RGB",
-            (len(CAMERAS) * panel_width, len(LAYERS) * (panel_height + LABEL_HEIGHT)),
-            "white",
-        )
-        draw = ImageDraw.Draw(composite)
-        for row, layer in enumerate(LAYERS):
-            for column, camera in enumerate(CAMERAS):
-                x = column * panel_width
-                y = row * (panel_height + LABEL_HEIGHT)
-                mass = by_batch[(batch_index, layer, camera)]["action_visual_attention_mass"]
-                draw.text((x + 4, y + 4), f"Layer {layer} | Camera {camera} | mass {mass:.3f}", fill="black")
-                composite.paste(panels[(layer, camera)], (x, y + LABEL_HEIGHT))
+        for layer in LAYERS:
+            layer_records = [by_batch[(batch_index, layer, camera)] for camera in CAMERAS]
+            originals = [_source_image(record, jsonl_path) for record in layer_records]
+            selections = [_selection_overlay(record, jsonl_path) for record in layer_records]
+            shared_peak = max(
+                max(record["action_visual_attention_distribution"]) for record in layer_records
+            )
+            heatmaps = [
+                _actual_attention_overlay(record, jsonl_path, shared_peak) for record in layer_records
+            ]
+            panel_width, panel_height = originals[0].size
+            if any(panel.size != (panel_width, panel_height) for panel in originals + selections + heatmaps):
+                raise ValueError("All camera images must have the same dimensions")
 
-        output_path = output_dir / (
-            f"call_{call_index:06d}_batch_{batch_index:03d}_"
-            f"final_step_{denoising_step:02d}_attention_composite.png"
-        )
-        if output_path.exists():
-            raise FileExistsError(f"Refusing to overwrite composite: {output_path}")
-        composite.save(output_path)
-        rendered += 1
+            row_height = panel_height + LABEL_HEIGHT
+            composite = Image.new(
+                "RGB",
+                (len(CAMERAS) * panel_width, TITLE_HEIGHT + 3 * row_height),
+                "white",
+            )
+            draw = ImageDraw.Draw(composite)
+            draw.text(
+                (4, 8),
+                f"call={call_index} | flow={denoising_step} | cross layer={layer}",
+                fill="black",
+            )
+            rows = (originals, selections, heatmaps)
+            for column, camera in enumerate(CAMERAS):
+                record = layer_records[column]
+                labels = (
+                    f"Camera {camera}",
+                    f"Focus Top-K selection | mean selected={record['selected_token_count']:.1f}",
+                    (
+                        "action->visual | visual-branch camera share="
+                        f"{record['action_visual_attention_mass']:.4f} | shared camera-relative scale"
+                        if record.get("action_visual_attention_scope") == "visual_branch"
+                        else "action->visual | total-prefix camera mass="
+                        f"{record['action_visual_attention_mass']:.4f} | shared camera-relative scale"
+                    ),
+                )
+                for row, panels in enumerate(rows):
+                    x = column * panel_width
+                    y = TITLE_HEIGHT + row * row_height
+                    draw.text((x + 4, y + 4), labels[row], fill="black")
+                    composite.paste(panels[column], (x, y + LABEL_HEIGHT))
+
+            output_path = output_dir / (
+                f"call_{call_index:06d}_flow_{denoising_step:03d}_cross_{layer:02d}_"
+                f"batch_{batch_index:03d}.png"
+            )
+            if output_path.exists():
+                raise FileExistsError(f"Refusing to overwrite composite: {output_path}")
+            composite.save(output_path)
+            rendered += 1
     return rendered
 
 

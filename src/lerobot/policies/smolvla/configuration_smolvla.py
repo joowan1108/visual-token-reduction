@@ -101,6 +101,8 @@ class SmolVLAConfig(PreTrainedConfig):
     focus_token_keep_ratio: float = 1.0
     focus_token_start_layer: int = 8
     focus_token_diagnostics_path: str | None = None
+    focus_cascaded_attention: bool = False
+    focus_channel_gate: bool = False
 
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
@@ -128,7 +130,9 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`focus_token_keep_ratio` must be in (0, 1].")
         if not 0 <= self.focus_token_start_layer < self.num_vlm_layers:
             raise ValueError("`focus_token_start_layer` must index a VLM layer.")
-        if self.focus_token_keep_ratio < 1:
+        if self.focus_channel_gate and not self.focus_cascaded_attention:
+            raise ValueError("`focus_channel_gate=True` requires `focus_cascaded_attention=True`.")
+        if self.focus_token_keep_ratio < 1 or self.focus_cascaded_attention:
             if (
                 self.num_vlm_layers != 16
                 or self.num_expert_layers not in (-1, 16)

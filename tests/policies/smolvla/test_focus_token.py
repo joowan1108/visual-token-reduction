@@ -21,6 +21,7 @@ from experiments.focus_token.visualize_focus_tokens import render_composites, re
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMWithExpertModel,
+    _per_query_visual_topk_mask,
     _select_visual_tokens,
 )
 
@@ -29,6 +30,8 @@ def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape()
     config = SmolVLAConfig()
     assert config.focus_token_keep_ratio == 1.0
     assert config.focus_token_diagnostics_path is None
+    assert not config.focus_cascaded_attention
+    assert not config.focus_channel_gate
 
     with pytest.raises(ValueError, match="keep_ratio"):
         SmolVLAConfig(focus_token_keep_ratio=0)
@@ -36,6 +39,30 @@ def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape()
         SmolVLAConfig(focus_token_keep_ratio=0.5, focus_token_start_layer=0, num_vlm_layers=8)
     with pytest.raises(ValueError, match="compile_model=False"):
         SmolVLAConfig(focus_token_keep_ratio=0.5, compile_model=True)
+    with pytest.raises(ValueError, match="requires"):
+        SmolVLAConfig(focus_channel_gate=True)
+
+
+def test_per_query_global_topk_selects_exact_and_different_visual_patches():
+    query = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])
+    keys = torch.tensor([[[[4.0, 0.0]], [[3.0, 0.0]], [[0.0, 2.0]], [[0.0, 1.0]]]])
+    mask = torch.ones(1, 2, 4, dtype=torch.bool)
+
+    selected, _ = _per_query_visual_topk_mask(query, keys, mask, 0.5)
+
+    assert selected.tolist() == [[[True, True, False, False], [False, False, True, True]]]
+    assert selected.sum(dim=-1).tolist() == [[2, 2]]
+
+
+def test_per_query_global_topk_uses_per_query_valid_ceil_budget():
+    query = torch.ones(1, 3, 1, 2)
+    keys = torch.arange(8, dtype=torch.float32).view(1, 4, 1, 2)
+    mask = torch.tensor([[[True, True, True, True], [True, True, True, False], [False] * 4]])
+
+    selected, _ = _per_query_visual_topk_mask(query, keys, mask, 0.5)
+
+    assert selected.sum(dim=-1).tolist() == [[2, 2, 0]]
+    assert not (selected & ~mask).any()
 
 
 def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order():
@@ -97,6 +124,8 @@ def _make_cross_attention_model():
     model.num_key_value_heads = 1
     model.focus_token_keep_ratio = 0.5
     model.focus_token_start_layer = 8
+    model.focus_cascaded_attention = False
+    model.focus_channel_gate = False
     vlm_layer = _FakeLayer(4, 4, 2)
     expert_layer = _FakeLayer(4, 4, 2)
     expert_layer.self_attn.k_proj = nn.Linear(2, 2, bias=False)
@@ -177,6 +206,106 @@ def test_focus_token_layer_boundary_dense_identity_and_direct_cached_paths():
     assert all(layer.keys.shape[2] == 8 for layer in cache.layers)
 
 
+def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusion():
+    torch.manual_seed(1)
+    model, layers = _make_cross_attention_model()
+    model.focus_cascaded_attention = True
+    model.focus_channel_gate = True
+    model.cascaded_fusion = nn.ModuleDict({"1": nn.Linear(8, 4)})
+    model.focus_gates = nn.ModuleDict({"1": nn.Sequential(nn.Linear(4, 4), nn.SiLU(), nn.Linear(4, 4))})
+    prefix = torch.randn(1, 10, 4)
+    suffix = torch.randn(1, 2, 4, requires_grad=True)
+    observed_masks = []
+
+    def attention(mask, batch_size, head_dim, queries, keys, values):
+        observed_masks.append(mask.detach().clone())
+        return model.eager_attention_forward(mask, batch_size, head_dim, queries, keys, values)
+
+    model.get_attention_interface = lambda: attention
+    outputs, _ = model.forward_cross_attn_layer(
+        layers,
+        [prefix, suffix],
+        1,
+        torch.arange(12).unsqueeze(0),
+        torch.ones(1, 12, 12, dtype=torch.bool),
+        1,
+        2,
+        use_cache=False,
+        visual_token_spans=((0, 4), (4, 8)),
+    )
+
+    # Prefix self-attention, condition branch, then visual branch.
+    assert observed_masks[-2].shape[-1] == 2
+    assert observed_masks[-2].all()
+    assert observed_masks[-1].shape[-1] == 8
+    assert observed_masks[-1].sum(dim=-1).tolist() == [[4, 4]]
+    gate = torch.sigmoid(model.focus_gates["1"](suffix))
+    assert gate.shape == suffix.shape
+    assert torch.all((0 <= gate) & (gate <= 1))
+    outputs[1].sum().backward()
+    assert suffix.grad is not None and torch.isfinite(suffix.grad).all()
+    assert model.cascaded_fusion["1"].weight.grad is not None
+    assert model.focus_gates["1"][0].weight.grad is not None
+    assert model.focus_gates["1"][2].weight.grad is not None
+
+
+def test_eager_attention_zeroes_masked_probabilities_and_fully_invalid_queries():
+    model, _ = _make_cross_attention_model()
+    queries = torch.ones(1, 2, 2, 2)
+    keys = torch.ones(1, 3, 1, 2)
+    values = torch.arange(6, dtype=torch.float32).view(1, 3, 1, 2)
+    mask = torch.tensor([[[True, False, True], [False, False, False]]])
+    captured = []
+    model._capture_action_visual_attention = lambda probs: captured.append(probs.detach())
+
+    output = model.eager_attention_forward(mask, 1, 2, queries, keys, values)
+
+    assert torch.equal(captured[0][..., 1], torch.zeros_like(captured[0][..., 1]))
+    assert torch.equal(captured[0][:, :, 1], torch.zeros_like(captured[0][:, :, 1]))
+    assert torch.equal(output[:, 1], torch.zeros_like(output[:, 1]))
+
+
+def test_eager_attention_condition_padding_does_not_change_output():
+    torch.manual_seed(2)
+    model, _ = _make_cross_attention_model()
+    queries = torch.randn(1, 1, 2, 2)
+    keys = torch.randn(1, 3, 1, 2)
+    values = torch.randn(1, 3, 1, 2)
+    padded_keys = torch.cat([keys, torch.randn(1, 1, 1, 2)], dim=1)
+    padded_values = torch.cat([values, torch.randn(1, 1, 1, 2)], dim=1)
+
+    expected = model.eager_attention_forward(
+        torch.ones(1, 1, 3, dtype=torch.bool), 1, 2, queries, keys, values
+    )
+    actual = model.eager_attention_forward(
+        torch.tensor([[[True, True, True, False]]]), 1, 2, queries, padded_keys, padded_values
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_cascaded_diagnostics_name_visual_branch_camera_share():
+    model, _ = _make_cross_attention_model()
+    records = [
+        {
+            "batch_index": 0,
+            "camera": 0,
+            "action_visual_attention_scope": "visual_branch",
+        }
+    ]
+    model._focus_token_attention_diagnostics = (
+        ((0, 2),),
+        torch.tensor([[0, 1]]),
+        records,
+    )
+
+    model._capture_action_visual_attention(torch.tensor([[[[0.25, 0.75]]]]))
+
+    assert records[0]["action_visual_attention_scope"] == "visual_branch"
+    assert records[0]["visual_branch_camera_attention_share"] == pytest.approx(1.0)
+    assert "total_prefix_camera_attention_mass" not in records[0]
+
+
 def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypatch):
     model, layers = _make_cross_attention_model()
     prefix = torch.arange(32, dtype=torch.float32).view(1, 8, 4)
@@ -233,6 +362,10 @@ def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypa
     assert records[0]["action_visual_attention_mass"] + records[1][
         "action_visual_attention_mass"
     ] == pytest.approx(1.0)
+    assert records[0]["action_visual_attention_scope"] == "total_prefix"
+    assert records[0]["total_prefix_camera_attention_mass"] == pytest.approx(
+        records[0]["action_visual_attention_mass"]
+    )
     assert all(
         value == 0
         for index, value in enumerate(records[0]["action_visual_attention_distribution"])
@@ -277,6 +410,7 @@ def test_focus_token_visualizers_preserve_selector_overlays_and_render_smooth_co
                     "denoising_step": 9,
                     "image_path": str(image_path),
                     "selected_indices": [0],
+                    "selected_token_count": 1,
                     "attention_distribution": selector_distribution,
                     "action_visual_attention_mass": 0.25,
                     "action_visual_attention_distribution": action_distribution,
@@ -290,7 +424,8 @@ def test_focus_token_visualizers_preserve_selector_overlays_and_render_smooth_co
     assert len(list(overlay_dir.glob("*.png"))) == 8
 
     composite_dir = tmp_path / "composites"
-    assert render_composites(jsonl_path, composite_dir) == 1
+    assert render_composites(jsonl_path, composite_dir) == 4
     with Image.open(next(composite_dir.glob("*.png"))) as composite:
-        panel = composite.crop((0, 24, 32, 56))
+        assert composite.size == (64, 200)
+        panel = composite.crop((0, 168, 32, 200))
         assert len(panel.getcolors(maxcolors=32 * 32)) > 8

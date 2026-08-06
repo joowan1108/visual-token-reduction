@@ -150,6 +150,67 @@ def _select_visual_tokens(
     return key_states, value_states, attention_mask, selected_indices
 
 
+def _per_query_visual_topk_mask(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    keep_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a global visual Top-K mask and its head-averaged QK logits for every action query."""
+    batch_size, _, num_key_value_heads, head_dim = key_states.shape
+    num_query_heads = query_states.shape[2]
+    key_for_scores = key_states.repeat_interleave(num_query_heads // num_key_value_heads, dim=2)
+    scores = torch.einsum("bqhd,bvhd->bqv", query_states.float(), key_for_scores.float())
+    scores /= num_query_heads * math.sqrt(head_dim)
+
+    valid = attention_mask.bool()
+    selected = torch.zeros_like(valid)
+    for batch_idx in range(batch_size):
+        for query_idx in range(query_states.shape[1]):
+            valid_indices = torch.nonzero(valid[batch_idx, query_idx], as_tuple=False).squeeze(1)
+            if valid_indices.numel() == 0:
+                continue
+            count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
+            chosen = torch.topk(scores[batch_idx, query_idx, valid_indices], count, sorted=False).indices
+            selected[batch_idx, query_idx, valid_indices[chosen]] = True
+    return selected, scores
+
+
+def _cascaded_diagnostics(
+    scores: torch.Tensor,
+    selected: torch.Tensor,
+    visual_mask: torch.Tensor,
+    visual_positions: torch.Tensor,
+    visual_token_spans: tuple[tuple[int, int], ...],
+) -> list[dict]:
+    records = []
+    for batch_idx in range(scores.shape[0]):
+        valid = visual_mask[batch_idx]
+        masked_scores = scores[batch_idx].masked_fill(~valid, torch.finfo(scores.dtype).min)
+        selector_probs = masked_scores.softmax(dim=-1).masked_fill(~valid, 0)
+        for camera_idx, (start, end) in enumerate(visual_token_spans):
+            camera_tokens = (visual_positions >= start) & (visual_positions < end)
+            camera_selected = selected[batch_idx, :, camera_tokens]
+            selection_frequency = camera_selected.float().mean(dim=0)
+            selected_local = torch.nonzero(selection_frequency > 0, as_tuple=False).squeeze(1)
+            camera_probs = selector_probs[:, camera_tokens]
+            records.append(
+                {
+                    "batch_index": batch_idx,
+                    "camera": camera_idx,
+                    "valid_token_count": int(valid[:, camera_tokens].any(dim=0).sum().item()),
+                    "selected_token_count": float(camera_selected.sum(dim=1).float().mean().item()),
+                    "selected_indices": selected_local.tolist(),
+                    "selected_prefix_indices": visual_positions[camera_tokens][selected_local].tolist(),
+                    "attention_distribution": camera_selected.float().mean(dim=0).tolist(),
+                    "topk_attention_mass": float(
+                        (camera_probs * camera_selected).sum(dim=1).mean().item()
+                    ),
+                }
+            )
+    return records
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -165,6 +226,8 @@ class SmolVLMWithExpertModel(nn.Module):
         focus_token_keep_ratio: float = 1.0,
         focus_token_start_layer: int = 8,
         focus_token_diagnostics_path: str | None = None,
+        focus_cascaded_attention: bool = False,
+        focus_channel_gate: bool = False,
         device: str = "auto",
     ):
         super().__init__()
@@ -228,6 +291,33 @@ class SmolVLMWithExpertModel(nn.Module):
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.focus_token_keep_ratio = focus_token_keep_ratio
         self.focus_token_start_layer = focus_token_start_layer
+        self.focus_cascaded_attention = focus_cascaded_attention
+        self.focus_channel_gate = focus_channel_gate
+        self.cascaded_fusion = nn.ModuleDict()
+        self.focus_gates = nn.ModuleDict()
+        if focus_cascaded_attention:
+            for layer_idx in range(self.num_vlm_layers):
+                if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
+                    continue
+                fusion = nn.Linear(2 * self.expert_hidden_size, self.expert_hidden_size)
+                with torch.no_grad():
+                    fusion.weight.zero_()
+                    fusion.bias.zero_()
+                    identity = torch.eye(self.expert_hidden_size)
+                    fusion.weight[:, : self.expert_hidden_size].copy_(identity * 0.5)
+                    fusion.weight[:, self.expert_hidden_size :].copy_(identity * 0.5)
+                self.cascaded_fusion[str(layer_idx)] = fusion
+                if focus_channel_gate:
+                    gate = nn.Sequential(
+                        nn.Linear(self.expert_hidden_size, self.expert_hidden_size),
+                        nn.SiLU(),
+                        nn.Linear(self.expert_hidden_size, self.expert_hidden_size),
+                    )
+                    nn.init.normal_(gate[0].weight, std=0.02)
+                    nn.init.zeros_(gate[0].bias)
+                    nn.init.normal_(gate[2].weight, std=0.001)
+                    nn.init.constant_(gate[2].bias, 2.0)
+                    self.focus_gates[str(layer_idx)] = gate
         self.focus_token_diagnostics_path = None
         self.focus_token_diagnostics_context = {}
         self.focus_token_diagnostics_call_index = 0
@@ -327,13 +417,20 @@ class SmolVLMWithExpertModel(nn.Module):
             start, end = visual_token_spans[record["camera"]]
             original_indices = original_prefix_indices[batch_idx]
             is_camera_token = (original_indices >= start) & (original_indices < end)
-            distribution = torch.zeros(64, device=probs.device)
+            distribution = torch.zeros(end - start, device=probs.device)
             distribution.scatter_add_(
                 0,
                 original_indices[is_camera_token] - start,
                 action_attention[batch_idx, is_camera_token],
             )
-            record["action_visual_attention_mass"] = float(distribution.sum().item())
+            mass = float(distribution.sum().item())
+            scope = record.get("action_visual_attention_scope", "total_prefix")
+            record["action_visual_attention_scope"] = scope
+            record["action_visual_attention_mass"] = mass
+            if scope == "visual_branch":
+                record["visual_branch_camera_attention_share"] = mass
+            else:
+                record["total_prefix_camera_attention_mass"] = mass
             record["action_visual_attention_distribution"] = distribution.tolist()
 
     def get_vlm_model(self):
@@ -569,6 +666,89 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
+            if self.focus_cascaded_attention and visual_token_spans:
+                visual_positions = torch.cat(
+                    [
+                        torch.arange(start, end, device=expert_key_states.device)
+                        for start, end in visual_token_spans
+                    ]
+                )
+                is_visual = torch.zeros(
+                    expert_key_states.shape[1], dtype=torch.bool, device=expert_key_states.device
+                )
+                is_visual[visual_positions] = True
+                condition_positions = torch.nonzero(~is_visual, as_tuple=False).squeeze(1)
+
+                visual_keys = expert_key_states.index_select(1, visual_positions)
+                visual_values = expert_value_states.index_select(1, visual_positions)
+                visual_mask = expert_attention_mask.index_select(2, visual_positions).bool()
+                condition_keys = expert_key_states.index_select(1, condition_positions)
+                condition_values = expert_value_states.index_select(1, condition_positions)
+                condition_mask = expert_attention_mask.index_select(2, condition_positions).bool()
+
+                selected, scores = _per_query_visual_topk_mask(
+                    expert_query_states, visual_keys, visual_mask, self.focus_token_keep_ratio
+                )
+                visual_mask &= selected
+                diagnostics = None
+                if getattr(self, "focus_token_diagnostics_image_paths", None):
+                    diagnostics = _cascaded_diagnostics(
+                        scores,
+                        selected,
+                        expert_attention_mask.index_select(2, visual_positions).bool(),
+                        visual_positions,
+                        visual_token_spans,
+                    )
+                    for record in diagnostics:
+                        record["action_visual_attention_scope"] = "visual_branch"
+
+                condition_output = attention_interface(
+                    condition_mask,
+                    batch_size,
+                    head_dim,
+                    expert_query_states,
+                    condition_keys,
+                    condition_values,
+                )
+                condition_output *= condition_mask.any(dim=-1, keepdim=True).to(condition_output.dtype)
+                if diagnostics:
+                    self._focus_token_attention_diagnostics = (
+                        visual_token_spans,
+                        visual_positions.expand(batch_size, -1),
+                        diagnostics,
+                    )
+                try:
+                    visual_output = attention_interface(
+                        visual_mask,
+                        batch_size,
+                        head_dim,
+                        expert_query_states,
+                        visual_keys,
+                        visual_values,
+                    )
+                    visual_output *= visual_mask.any(dim=-1, keepdim=True).to(visual_output.dtype)
+                finally:
+                    self._focus_token_attention_diagnostics = None
+
+                gate = None
+                if self.focus_channel_gate:
+                    gate = torch.sigmoid(self.focus_gates[str(layer_idx)](expert_hidden_states))
+                    visual_output = visual_output * gate.to(dtype=visual_output.dtype)
+                att_output = self.cascaded_fusion[str(layer_idx)](
+                    torch.cat([condition_output, visual_output], dim=-1).to(
+                        dtype=self.cascaded_fusion[str(layer_idx)].weight.dtype
+                    )
+                )
+                if diagnostics:
+                    if gate is not None:
+                        for record in diagnostics:
+                            batch_gate = gate[record["batch_index"]].detach().float()
+                            record["gate_mean"] = float(batch_gate.mean().item())
+                            record["gate_std"] = float(batch_gate.std().item())
+                    self._write_focus_token_diagnostics(layer_idx, diagnostics)
+                att_outputs.append(att_output)
+                return att_outputs, past_key_values
+
             if (
                 self.focus_token_keep_ratio < 1
                 and layer_idx >= self.focus_token_start_layer
@@ -612,6 +792,10 @@ class SmolVLMWithExpertModel(nn.Module):
                                     "selected_token_count": int(selected.numel()),
                                     "selected_indices": selected.tolist(),
                                     "selected_prefix_indices": (selected + start).tolist(),
+                                    "attention_distribution": [
+                                        float(index in selected.tolist()) for index in range(end - start)
+                                    ],
+                                    "topk_attention_mass": 1.0,
                                 }
                             )
 
@@ -799,6 +983,7 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        probs = probs.masked_fill(~attention_mask[:, None, :, :], 0)
         probs = probs.to(dtype=value_states.dtype)
         self._capture_action_visual_attention(probs)
 

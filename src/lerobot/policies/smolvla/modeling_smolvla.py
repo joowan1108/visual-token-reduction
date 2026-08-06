@@ -506,6 +506,8 @@ class VLAFlowMatching(nn.Module):
             focus_token_keep_ratio=self.config.focus_token_keep_ratio,
             focus_token_start_layer=self.config.focus_token_start_layer,
             focus_token_diagnostics_path=self.config.focus_token_diagnostics_path,
+            focus_cascaded_attention=self.config.focus_cascaded_attention,
+            focus_channel_gate=self.config.focus_channel_gate,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
