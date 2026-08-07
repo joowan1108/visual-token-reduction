@@ -289,6 +289,7 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+        expert_attention_width = lm_expert_config.num_attention_heads * lm_expert_config.head_dim
         self.focus_token_keep_ratio = focus_token_keep_ratio
         self.focus_token_start_layer = focus_token_start_layer
         self.focus_cascaded_attention = focus_cascaded_attention
@@ -299,19 +300,19 @@ class SmolVLMWithExpertModel(nn.Module):
             for layer_idx in range(self.num_vlm_layers):
                 if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
                     continue
-                fusion = nn.Linear(2 * self.expert_hidden_size, self.expert_hidden_size)
+                fusion = nn.Linear(2 * expert_attention_width, expert_attention_width)
                 with torch.no_grad():
                     fusion.weight.zero_()
                     fusion.bias.zero_()
-                    identity = torch.eye(self.expert_hidden_size)
-                    fusion.weight[:, : self.expert_hidden_size].copy_(identity * 0.5)
-                    fusion.weight[:, self.expert_hidden_size :].copy_(identity * 0.5)
+                    identity = torch.eye(expert_attention_width)
+                    fusion.weight[:, :expert_attention_width].copy_(identity * 0.5)
+                    fusion.weight[:, expert_attention_width:].copy_(identity * 0.5)
                 self.cascaded_fusion[str(layer_idx)] = fusion
                 if focus_channel_gate:
                     gate = nn.Sequential(
                         nn.Linear(self.expert_hidden_size, self.expert_hidden_size),
                         nn.SiLU(),
-                        nn.Linear(self.expert_hidden_size, self.expert_hidden_size),
+                        nn.Linear(self.expert_hidden_size, expert_attention_width),
                     )
                     nn.init.normal_(gate[0].weight, std=0.02)
                     nn.init.zeros_(gate[0].bias)

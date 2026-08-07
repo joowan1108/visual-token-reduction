@@ -211,14 +211,18 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     model, layers = _make_cross_attention_model()
     model.focus_cascaded_attention = True
     model.focus_channel_gate = True
+    expert_layer = _FakeLayer(3, 4, 2)
+    expert_layer.self_attn.k_proj = nn.Linear(2, 2, bias=False)
+    expert_layer.self_attn.v_proj = nn.Linear(2, 2, bias=False)
+    layers[1] = [expert_layer] * 16
     model.cascaded_fusion = nn.ModuleDict({"1": nn.Linear(8, 4)})
-    model.focus_gates = nn.ModuleDict({"1": nn.Sequential(nn.Linear(4, 4), nn.SiLU(), nn.Linear(4, 4))})
+    model.focus_gates = nn.ModuleDict({"1": nn.Sequential(nn.Linear(3, 3), nn.SiLU(), nn.Linear(3, 4))})
     for branch in layers:
         for layer in branch:
             for projection in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
                 projection.to(dtype=torch.bfloat16)
     prefix = torch.randn(1, 10, 4, dtype=torch.bfloat16)
-    suffix = torch.randn(1, 2, 4, dtype=torch.bfloat16, requires_grad=True)
+    suffix = torch.randn(1, 2, 3, dtype=torch.bfloat16, requires_grad=True)
     observed_masks = []
 
     def attention(mask, batch_size, head_dim, queries, keys, values):
@@ -244,7 +248,7 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     assert observed_masks[-1].shape[-1] == 8
     assert observed_masks[-1].sum(dim=-1).tolist() == [[4, 4]]
     gate = torch.sigmoid(model.focus_gates["1"](suffix.float()))
-    assert gate.shape == suffix.shape
+    assert gate.shape == outputs[1].shape
     assert torch.all((0 <= gate) & (gate <= 1))
     outputs[1].sum().backward()
     assert suffix.grad is not None and torch.isfinite(suffix.grad).all()
