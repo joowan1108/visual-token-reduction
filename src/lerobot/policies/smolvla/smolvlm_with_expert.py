@@ -176,6 +176,14 @@ def _per_query_visual_topk_mask(
     return selected, scores
 
 
+def _uses_cascaded_focus_layer(
+    layer_idx: int, focus_token_start_layer: int, self_attn_every_n_layers: int
+) -> bool:
+    return layer_idx >= focus_token_start_layer and not (
+        self_attn_every_n_layers > 0 and layer_idx % self_attn_every_n_layers == 0
+    )
+
+
 def _cascaded_diagnostics(
     scores: torch.Tensor,
     selected: torch.Tensor,
@@ -298,7 +306,9 @@ class SmolVLMWithExpertModel(nn.Module):
         self.focus_gates = nn.ModuleDict()
         if focus_cascaded_attention:
             for layer_idx in range(self.num_vlm_layers):
-                if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
+                if not _uses_cascaded_focus_layer(
+                    layer_idx, self.focus_token_start_layer, self.self_attn_every_n_layers
+                ):
                     continue
                 fusion = nn.Linear(2 * expert_attention_width, expert_attention_width)
                 with torch.no_grad():
@@ -667,7 +677,13 @@ class SmolVLMWithExpertModel(nn.Module):
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
-            if self.focus_cascaded_attention and visual_token_spans:
+            if (
+                self.focus_cascaded_attention
+                and visual_token_spans
+                and _uses_cascaded_focus_layer(
+                    layer_idx, self.focus_token_start_layer, self.self_attn_every_n_layers
+                )
+            ):
                 visual_positions = torch.cat(
                     [
                         torch.arange(start, end, device=expert_key_states.device)

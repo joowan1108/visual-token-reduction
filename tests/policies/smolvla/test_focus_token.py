@@ -23,6 +23,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMWithExpertModel,
     _per_query_visual_topk_mask,
     _select_visual_tokens,
+    _uses_cascaded_focus_layer,
 )
 
 
@@ -124,6 +125,7 @@ def _make_cross_attention_model():
     model.num_key_value_heads = 1
     model.focus_token_keep_ratio = 0.5
     model.focus_token_start_layer = 8
+    model.self_attn_every_n_layers = 2
     model.focus_cascaded_attention = False
     model.focus_channel_gate = False
     vlm_layer = _FakeLayer(4, 4, 2)
@@ -210,6 +212,7 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     torch.manual_seed(1)
     model, layers = _make_cross_attention_model()
     model.focus_cascaded_attention = True
+    model.focus_token_start_layer = 1
     model.focus_channel_gate = True
     expert_layer = _FakeLayer(3, 4, 2)
     expert_layer.self_attn.k_proj = nn.Linear(2, 2, bias=False)
@@ -255,6 +258,58 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     assert model.cascaded_fusion["1"].weight.grad is not None
     assert model.focus_gates["1"][0].weight.grad is not None
     assert model.focus_gates["1"][2].weight.grad is not None
+
+
+def test_cascaded_focus_preserves_early_cross_attention_layers():
+    model, layers = _make_cross_attention_model()
+    model.focus_cascaded_attention = True
+    target_layers = [
+        layer_idx
+        for layer_idx in range(16)
+        if _uses_cascaded_focus_layer(layer_idx, model.focus_token_start_layer, 2)
+    ]
+    assert target_layers == [9, 11, 13, 15]
+    model.cascaded_fusion = nn.ModuleDict(
+        {str(layer_idx): nn.Linear(8, 4) for layer_idx in target_layers}
+    )
+    prefix = torch.randn(1, 10, 4)
+    suffix = torch.randn(1, 2, 4)
+    positions = torch.arange(12).unsqueeze(0)
+    mask = torch.ones(1, 12, 12, dtype=torch.bool)
+    observed_key_lengths = []
+
+    def attention(attention_mask, batch_size, head_dim, queries, keys, values):
+        observed_key_lengths.append(keys.shape[1])
+        return model.eager_attention_forward(
+            attention_mask, batch_size, head_dim, queries, keys, values
+        )
+
+    model.get_attention_interface = lambda: attention
+    model.forward_cross_attn_layer(
+        layers,
+        [prefix, suffix],
+        7,
+        positions,
+        mask,
+        1,
+        2,
+        use_cache=False,
+        visual_token_spans=((0, 4), (4, 8)),
+    )
+    assert observed_key_lengths[-2:] == [10, 10]
+
+    model.forward_cross_attn_layer(
+        layers,
+        [prefix, suffix],
+        9,
+        positions,
+        mask,
+        1,
+        2,
+        use_cache=False,
+        visual_token_spans=((0, 4), (4, 8)),
+    )
+    assert observed_key_lengths[-3:] == [10, 2, 8]
 
 
 def test_eager_attention_zeroes_masked_probabilities_and_fully_invalid_queries():
