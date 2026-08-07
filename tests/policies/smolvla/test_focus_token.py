@@ -385,7 +385,9 @@ def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypa
     dense_records = [json.loads(line) for line in output.getvalue().splitlines()]
     assert len(dense_records) == 2
     assert dense_records[0]["selected_indices"] == [0, 1, 2, 3]
-    assert len(dense_records[0]["action_visual_attention_distribution"]) == 64
+    assert len(dense_records[0]["action_visual_attention_distribution"]) == dense_records[0][
+        "valid_token_count"
+    ]
     assert dense_records[0]["action_visual_attention_mass"] + dense_records[1][
         "action_visual_attention_mass"
     ] == pytest.approx(1.0)
