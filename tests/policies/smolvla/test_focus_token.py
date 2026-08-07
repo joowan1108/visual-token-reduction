@@ -213,8 +213,12 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     model.focus_channel_gate = True
     model.cascaded_fusion = nn.ModuleDict({"1": nn.Linear(8, 4)})
     model.focus_gates = nn.ModuleDict({"1": nn.Sequential(nn.Linear(4, 4), nn.SiLU(), nn.Linear(4, 4))})
-    prefix = torch.randn(1, 10, 4)
-    suffix = torch.randn(1, 2, 4, requires_grad=True)
+    for branch in layers:
+        for layer in branch:
+            for projection in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
+                projection.to(dtype=torch.bfloat16)
+    prefix = torch.randn(1, 10, 4, dtype=torch.bfloat16)
+    suffix = torch.randn(1, 2, 4, dtype=torch.bfloat16, requires_grad=True)
     observed_masks = []
 
     def attention(mask, batch_size, head_dim, queries, keys, values):
@@ -239,7 +243,7 @@ def test_cascaded_attention_normalizes_branches_and_backpropagates_gate_and_fusi
     assert observed_masks[-2].all()
     assert observed_masks[-1].shape[-1] == 8
     assert observed_masks[-1].sum(dim=-1).tolist() == [[4, 4]]
-    gate = torch.sigmoid(model.focus_gates["1"](suffix))
+    gate = torch.sigmoid(model.focus_gates["1"](suffix.float()))
     assert gate.shape == suffix.shape
     assert torch.all((0 <= gate) & (gate <= 1))
     outputs[1].sum().backward()

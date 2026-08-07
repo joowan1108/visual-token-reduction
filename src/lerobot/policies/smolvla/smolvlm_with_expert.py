@@ -732,7 +732,10 @@ class SmolVLMWithExpertModel(nn.Module):
 
                 gate = None
                 if self.focus_channel_gate:
-                    gate = torch.sigmoid(self.focus_gates[str(layer_idx)](expert_hidden_states))
+                    gate_module = self.focus_gates[str(layer_idx)]
+                    gate = torch.sigmoid(
+                        gate_module(expert_hidden_states.to(dtype=gate_module[0].weight.dtype))
+                    )
                     visual_output = visual_output * gate.to(dtype=visual_output.dtype)
                 att_output = self.cascaded_fusion[str(layer_idx)](
                     torch.cat([condition_output, visual_output], dim=-1).to(
