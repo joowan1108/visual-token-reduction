@@ -355,7 +355,7 @@ def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypa
     assert records[0]["valid_token_count"] == 4
     assert records[0]["selected_token_count"] == 2
     assert 0 < records[0]["topk_attention_mass"] <= 1
-    assert len(records[0]["action_visual_attention_distribution"]) == 64
+    assert len(records[0]["action_visual_attention_distribution"]) == records[0]["valid_token_count"]
     assert records[0]["action_visual_attention_mass"] == pytest.approx(
         sum(records[0]["action_visual_attention_distribution"])
     )
