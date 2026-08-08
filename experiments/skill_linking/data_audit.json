@@ -1,0 +1,49 @@
+{
+  "dataset": "sungkyunner/libero_10_subtask_semantic_clean",
+  "revision": "d619815aeba9c06c70fc558838137dd57a651ce1",
+  "horizon": 10,
+  "full": {
+    "episodes": 495,
+    "frames": 136425,
+    "atomic_segments": 941,
+    "atomic_indices": 127015,
+    "pair_indices": 446,
+    "directed_pair_types": 9,
+    "minimum_pre_boundary_frames": 74
+  },
+  "split": {
+    "train_episodes": 445,
+    "heldout_episodes": 50,
+    "train_frames": 122812,
+    "heldout_frames": 13613,
+    "train_atomic_indices": 114352,
+    "heldout_atomic_indices": 12663,
+    "train_pair_indices": 401,
+    "heldout_pair_indices": 45
+  },
+  "task_episode_counts": {
+    "0": 50,
+    "1": 50,
+    "2": 50,
+    "3": 47,
+    "4": 50,
+    "5": 50,
+    "6": 50,
+    "7": 50,
+    "8": 49,
+    "9": 49
+  },
+  "directed_pairs": {
+    "5->4": 47,
+    "6->3": 49,
+    "6->7": 50,
+    "8->2": 50,
+    "9->12": 50,
+    "9->13": 50,
+    "12->11": 50,
+    "14->1": 50,
+    "15->4": 50
+  },
+  "pair_rule": "one start index b-H per adjacent-subtask boundary b",
+  "materialized_pair_dataset": false
+}

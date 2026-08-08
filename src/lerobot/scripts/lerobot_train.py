@@ -51,8 +51,8 @@ from lerobot.common.train_utils import (
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
+from lerobot.datasets.sampler import EpisodeAwareSampler, SkillLinkingSampler, compute_sampler_state
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -304,6 +304,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset, eval_dataset = make_train_eval_datasets(cfg)
 
+    active_cfg = cfg.trainable_config
+    skill_linking_sampler = None
+    use_skill_linking_sampler = not cfg.is_reward_model_training and (
+        getattr(active_cfg, "skill_linking_enabled", False)
+        or getattr(active_cfg, "skill_linking_sampler_enabled", False)
+    )
+    if use_skill_linking_sampler and cfg.dataset.streaming:
+        raise ValueError("Skill-linking sampling requires a non-streaming dataset.")
+    if use_skill_linking_sampler:
+        skill_linking_sampler = SkillLinkingSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            subtask_indices=dataset.hf_dataset.data.column("subtask_index").to_numpy(),
+            action_horizon=active_cfg.n_action_steps,
+            episode_indices_to_use=dataset.episodes,
+            shuffle=True,
+            seed=cfg.seed if cfg.seed is not None else 0,
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+        )
+        if getattr(active_cfg, "skill_linking_enabled", False) and active_cfg.skill_transition_class_weights is None:
+            if cfg.dataset.episodes is not None:
+                raise ValueError(
+                    "Subset skill-linking runs require class weights frozen from the full train split."
+                )
+            active_cfg.skill_transition_class_weights = skill_linking_sampler.transition_class_weights(
+                active_cfg.skill_linking_num_skills
+            )
+            if is_main_process:
+                logging.info(f"Deterministic skill transition class weights: {active_cfg.skill_transition_class_weights}")
+
     if cfg.is_reward_model_training:
         if is_main_process:
             logging.info("Creating reward model")
@@ -343,7 +373,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
-    active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
 
     processor_kwargs = {}
@@ -454,15 +483,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
+        if use_skill_linking_sampler:
+            sampler = skill_linking_sampler
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=True,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
             # use the values recorded in the checkpoint (falling back to the current ones for older

@@ -61,6 +61,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.import_utils import require_package
 
 from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
@@ -72,9 +73,7 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
-from ..utils import (
-    populate_queues,
-)
+from ..utils import populate_queues
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
@@ -83,6 +82,20 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    current_skill: Tensor | None
+
+
+def _list_safetensor_keys(model_file: str, map_location: str) -> set[str]:
+    from safetensors import safe_open
+
+    with safe_open(model_file, framework="pt", device=resolve_safetensors_device(map_location)) as handle:
+        return set(handle.keys())
+
+
+def _load_safetensor_model(model, model_file: str, map_location: str, strict: bool):
+    from safetensors.torch import load_model
+
+    return load_model(model, model_file, strict=strict, device=resolve_safetensors_device(map_location))
 
 
 def normalize(x, min_val, max_val):
@@ -172,6 +185,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._current_skill = None
+        self._pending_skill = None
+        self._last_transition_prediction = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -212,6 +228,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
+        if self._skill_linking_enabled():
+            actions, transition_logits = actions
+            self._pending_skill = transition_logits.argmax(dim=-1)
+            self._last_transition_prediction = self._pending_skill.clone()
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -232,6 +252,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def predict_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
+        if self._skill_linking_enabled():
+            raise RuntimeError("Skill linking supports synchronous select_action only.")
         self.eval()
 
         batch = self._prepare_batch(batch)
@@ -260,7 +282,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise)
+            current_skill = None
+            if self._skill_linking_enabled():
+                self._ensure_skill_state(batch[OBS_STATE].shape[0], batch[OBS_STATE].device)
+                self._apply_pending_skill()
+                current_skill = self._current_skill
+
+            actions = self._get_action_chunk(batch, noise, current_skill=current_skill)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -273,6 +301,108 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _skill_linking_enabled(self) -> bool:
+        return getattr(self.config, "skill_linking_enabled", False)
+
+    def _skill_start_index(self) -> int:
+        return int(self.config.skill_linking_num_skills)
+
+    def _skill_done_index(self) -> int:
+        return self._skill_start_index() + 1
+
+    def _ensure_skill_state(self, batch_size: int, device: torch.device) -> None:
+        if torch.is_tensor(self._current_skill):
+            if self._current_skill.shape == (batch_size,) and self._current_skill.device == device:
+                return
+        self._current_skill = torch.full(
+            (batch_size,), self._skill_start_index(), dtype=torch.long, device=device
+        )
+        self._pending_skill = None
+
+    def _apply_pending_skill(self) -> None:
+        if self._pending_skill is None:
+            return
+        update = (self._pending_skill > 0) & (self._pending_skill < self._skill_start_index())
+        self._current_skill = torch.where(update, self._pending_skill, self._current_skill)
+        self._pending_skill = None
+
+    def _validate_skill_transition_batch(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        horizon = self.config.n_action_steps
+        subtask_index = batch["subtask_index"]
+        subtask_index_is_pad = batch["subtask_index_is_pad"]
+        if subtask_index.ndim != 2 or subtask_index_is_pad.ndim != 2:
+            raise ValueError("Skill linking requires rank-2 `subtask_index` and `subtask_index_is_pad` tensors.")
+        if subtask_index.shape != subtask_index_is_pad.shape:
+            raise ValueError("`subtask_index` and `subtask_index_is_pad` must have the same shape.")
+        if subtask_index.shape[1] <= horizon:
+            raise ValueError(
+                f"Skill linking requires at least H+1 subtask labels; got shape {tuple(subtask_index.shape)} for H={horizon}."
+            )
+        frame_index = batch["frame_index"]
+        if frame_index.ndim > 1:
+            frame_index = frame_index[:, 0]
+        if frame_index.ndim != 1 or frame_index.shape[0] != subtask_index.shape[0]:
+            raise ValueError("`frame_index` must align with the batch dimension of `subtask_index`.")
+
+        labels = subtask_index.long()
+        pad = subtask_index_is_pad.bool()
+        num_skills = self.config.skill_linking_num_skills
+        current = labels[:, 0]
+        if pad[:, 0].any():
+            raise ValueError("`subtask_index[:, 0]` cannot be padded for skill linking.")
+        if ((current < 1) | (current >= num_skills)).any():
+            raise ValueError(f"Observed current semantic IDs must be in [1, {num_skills - 1}].")
+        next_labels = labels[:, horizon]
+        next_pad = pad[:, horizon]
+        if ((next_labels[~next_pad] < 1) | (next_labels[~next_pad] >= num_skills)).any():
+            raise ValueError(f"Observed next semantic IDs must be in [1, {num_skills - 1}] when not padded.")
+        return labels, pad, frame_index.long()
+
+    def _build_skill_transition_targets(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        horizon = self.config.n_action_steps
+        subtask_index, subtask_index_is_pad, frame_index = self._validate_skill_transition_batch(batch)
+
+        start = self._skill_start_index()
+        done = self._skill_done_index()
+        current_skill = subtask_index[:, 0].clone()
+        current_skill[frame_index == 0] = start
+
+        next_skill = subtask_index[:, horizon].long()
+        next_is_pad = subtask_index_is_pad[:, horizon]
+        target = next_skill.clone()
+        target[next_is_pad] = done
+        target[(~next_is_pad) & (current_skill != start) & (next_skill == current_skill)] = start
+        return current_skill, target
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        if not getattr(model.config, "skill_linking_enabled", False):
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+        if strict:
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        from lerobot.policies.utils import log_model_loading_keys
+
+        allowed_missing_prefixes = ("model.skill_embedding.", "model.transition_head.")
+        current = model.state_dict()
+        checkpoint_keys = _list_safetensor_keys(model_file, map_location)
+        skill_keys = [key for key in current if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)]
+        present_skill_keys = [key for key in skill_keys if key in checkpoint_keys]
+        if present_skill_keys and len(present_skill_keys) != len(skill_keys):
+            missing_skill_keys = [key for key in skill_keys if key not in checkpoint_keys]
+            raise ValueError(f"Partial skill-linking checkpoint is not allowed: missing {missing_skill_keys}")
+        unexpected = sorted(set(checkpoint_keys) - set(current))
+        if unexpected:
+            raise ValueError(f"Unexpected keys in checkpoint: {unexpected}")
+
+        missing_keys, unexpected_keys = _load_safetensor_model(model, model_file, map_location, strict=False)
+        if unexpected_keys:
+            raise ValueError(f"Unexpected keys after load: {unexpected_keys}")
+        if any(not any(key.startswith(prefix) for prefix in allowed_missing_prefixes) for key in missing_keys):
+            raise ValueError(f"Missing non-skill-linking keys after load: {missing_keys}")
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
 
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
@@ -298,7 +428,26 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        current_skill = None
+        transition_target = None
+        if self._skill_linking_enabled():
+            current_skill, transition_target = self._build_skill_transition_targets(batch)
+        model_output = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            current_skill=current_skill,
+        )
+        transition_logits = None
+        if self._skill_linking_enabled():
+            losses, transition_logits = model_output
+        else:
+            losses = model_output
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -312,24 +461,69 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        if not self._skill_linking_enabled():
+            if reduction == "none":
+                # Return per-sample losses (B,) by averaging over valid (time, action) entries
+                if actions_is_pad is None:
+                    per_sample_loss = losses.mean(dim=(1, 2))
+                else:
+                    num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
+                    per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+                loss_dict["loss"] = per_sample_loss.mean().item()
+                return per_sample_loss, loss_dict
+            else:
+                # Default: return scalar mean loss over valid (time, action) entries
+                if actions_is_pad is None:
+                    loss = losses.mean()
+                else:
+                    num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+                    loss = losses.sum() / num_valid
+                loss_dict["loss"] = loss.item()
+                return loss, loss_dict
+
+        class_weights = getattr(self.config, "skill_transition_class_weights", None)
+        transition_weight = (
+            None
+            if class_weights is None
+            else torch.tensor(class_weights, dtype=torch.float32, device=transition_logits.device)
+        )
+        transition_lambda = self.config.skill_transition_loss_weight
+        loss_dict["transition_logits_mean"] = transition_logits.float().mean().item()
+
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over valid (time, action) entries
             if actions_is_pad is None:
-                per_sample_loss = losses.mean(dim=(1, 2))
+                flow_loss = losses.mean(dim=(1, 2))
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
-                per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+                flow_loss = losses.sum(dim=(1, 2)) / num_valid
+            transition_loss = F.cross_entropy(
+                transition_logits.float(),
+                transition_target,
+                weight=transition_weight,
+                reduction="none",
+            )
+            per_sample_loss = flow_loss + transition_lambda * transition_loss
+            loss_dict["flow_loss"] = flow_loss.mean().item()
+            loss_dict["transition_loss"] = transition_loss.mean().item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
+
+        if actions_is_pad is None:
+            flow_loss = losses.mean()
         else:
-            # Default: return scalar mean loss over valid (time, action) entries
-            if actions_is_pad is None:
-                loss = losses.mean()
-            else:
-                num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
-                loss = losses.sum() / num_valid
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+            flow_loss = losses.sum() / num_valid
+        transition_loss = F.cross_entropy(
+            transition_logits.float(),
+            transition_target,
+            weight=transition_weight,
+            reduction="mean",
+        )
+        loss = flow_loss + transition_lambda * transition_loss
+        loss_dict["flow_loss"] = flow_loss.item()
+        loss_dict["transition_loss"] = transition_loss.item()
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -522,6 +716,16 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.skill_embedding = None
+        self.transition_head = None
+        if self._skill_linking_enabled():
+            self.skill_embedding = nn.Embedding(
+                self.config.skill_linking_num_skills + 1, self.vlm_with_expert.expert_hidden_size
+            )
+            nn.init.zeros_(self.skill_embedding.weight)
+            self.transition_head = nn.Linear(
+                self.vlm_with_expert.expert_hidden_size, self.config.skill_linking_num_skills + 2
+            )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -543,6 +747,9 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _skill_linking_enabled(self) -> bool:
+        return getattr(self.config, "skill_linking_enabled", False)
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -651,7 +858,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks, tuple(visual_token_spans)
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions, timestep, current_skill: Tensor | None = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -678,6 +885,11 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
+        if self._skill_linking_enabled():
+            if current_skill is None:
+                raise ValueError("Skill linking requires current_skill for suffix embedding.")
+            skill_emb = self.skill_embedding(current_skill.long().to(device=device))[:, None, :]
+            action_time_emb = action_time_emb + skill_emb.to(dtype=action_time_emb.dtype).expand_as(action_time_emb)
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -694,8 +906,14 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
+    def _transition_logits_from_suffix(self, suffix_out: Tensor) -> Tensor:
+        horizon = min(self.config.n_action_steps, suffix_out.shape[1])
+        pooled = suffix_out[:, :horizon].to(dtype=torch.float32).mean(dim=1)
+        pooled = pooled.to(dtype=self.transition_head.weight.dtype)
+        return self.transition_head(pooled).float()
+
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, current_skill=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -710,7 +928,7 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks, visual_token_spans = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, current_skill=current_skill)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -730,7 +948,9 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        if not self._skill_linking_enabled():
+            return losses
+        return losses, self._transition_logits_from_suffix(suffix_out)
 
     def sample_actions(
         self,
@@ -740,6 +960,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        current_skill: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -764,16 +985,26 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
         )
         num_steps = self.config.num_steps
+        latest_transition_logits = None
         self.vlm_with_expert.start_focus_token_diagnostics_call(images)
         try:
-            return euler_integrate(
-                lambda input_x_t, current_timestep: self.denoise_step(
+            def denoise_with_transition(input_x_t, current_timestep):
+                nonlocal latest_transition_logits
+                denoise_out = self.denoise_step(
                     x_t=input_x_t,
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
                     visual_token_spans=visual_token_spans,
-                ),
+                    current_skill=current_skill,
+                )
+                if self._skill_linking_enabled():
+                    velocity, latest_transition_logits = denoise_out
+                    return velocity
+                return denoise_out
+
+            actions = euler_integrate(
+                denoise_with_transition,
                 noise,
                 num_steps,
                 rtc_processor=self.rtc_processor,
@@ -782,6 +1013,11 @@ class VLAFlowMatching(nn.Module):
                 prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
                 execution_horizon=kwargs.get("execution_horizon"),
             )
+            if not self._skill_linking_enabled():
+                return actions
+            if latest_transition_logits is None:
+                raise RuntimeError("Skill linking expected transition logits from the final denoise step.")
+            return actions, latest_transition_logits
         finally:
             self.vlm_with_expert.end_focus_token_diagnostics_call()
 
@@ -792,6 +1028,7 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         visual_token_spans,
+        current_skill: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         if self.vlm_with_expert.focus_token_diagnostics_path is not None:
@@ -800,7 +1037,9 @@ class VLAFlowMatching(nn.Module):
                 denoising_step=round((1.0 - timestep_value) * self.config.num_steps),
                 denoising_timestep=timestep_value,
             )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, timestep, current_skill=current_skill
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -828,4 +1067,6 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        return v_t
+        if not self._skill_linking_enabled():
+            return v_t
+        return v_t, self._transition_logits_from_suffix(suffix_out)

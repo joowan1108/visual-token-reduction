@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
@@ -104,6 +105,13 @@ class SmolVLAConfig(PreTrainedConfig):
     focus_cascaded_attention: bool = False
     focus_channel_gate: bool = False
 
+    # Optional semantic skill linking for LIBERO-10. Disabled by default.
+    skill_linking_enabled: bool = False
+    skill_linking_sampler_enabled: bool = False
+    skill_linking_num_skills: int = 16
+    skill_transition_loss_weight: float = 0.1
+    skill_transition_class_weights: list[float] | None = None
+
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
@@ -145,6 +153,29 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if self.compile_model:
                 raise ValueError("Focus-token experiments require `compile_model=False`.")
+        if self.skill_linking_enabled:
+            if self.skill_linking_num_skills <= 0:
+                raise ValueError("`skill_linking_num_skills` must be positive.")
+            if self.n_action_steps <= 0:
+                raise ValueError("Skill linking requires `n_action_steps > 0`.")
+            if self.compile_model:
+                raise ValueError("Skill linking requires `compile_model=False`.")
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError("Skill linking does not support RTC.")
+            weights = self.skill_transition_class_weights
+            if weights is not None:
+                if len(weights) != self.skill_linking_num_skills + 2:
+                    raise ValueError(
+                        "`skill_transition_class_weights` must contain num_skills + 2 values."
+                    )
+                if weights[0] != 0 or any(
+                    not math.isfinite(weight) or weight <= 0 for weight in weights[1:]
+                ):
+                    raise ValueError(
+                        "Transition class weight 0 must be zero; every other weight must be positive and finite."
+                    )
+        if self.skill_linking_sampler_enabled and self.n_action_steps <= 0:
+            raise ValueError("Skill-linking sampling requires `n_action_steps > 0`.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
@@ -183,3 +214,7 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def subtask_delta_indices(self) -> list[int] | None:
+        return list(range(self.n_action_steps + 1)) if self.skill_linking_enabled else None
