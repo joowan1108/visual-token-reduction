@@ -86,7 +86,7 @@ def test_skill_linking_sampler_transition_class_counts_and_weights():
     torch.testing.assert_close(torch.tensor(weights[1:], dtype=torch.float32), expected)
 
 
-def test_skill_linking_sampler_one_boundary_balanced_order_and_resume():
+def test_skill_linking_sampler_one_boundary_75_25_order_and_resume():
     kwargs = {
         "dataset_from_indices": [0],
         "dataset_to_indices": [7],
@@ -104,9 +104,16 @@ def test_skill_linking_sampler_one_boundary_balanced_order_and_resume():
     assert sampler.event_candidates == [0, 1, 5]
 
     epoch = list(sampler)
-    assert len(epoch[0::2]) == len(epoch[1::2]) == 3
-    assert set(epoch[0::2]) == set(sampler.atomic_candidates)
-    assert set(epoch[1::2]) == set(sampler.event_candidates)
+    atomic_draws = [sample for position, sample in enumerate(epoch) if position % 4 < 3]
+    event_draws = epoch[3::4]
+    assert len(epoch) == 12
+    assert len(atomic_draws) == 9
+    assert len(event_draws) == 3
+    assert set(atomic_draws) == set(sampler.atomic_candidates)
+    assert set(event_draws) == set(sampler.event_candidates)
+
+    repeated = SkillLinkingSampler(**kwargs)
+    assert list(repeated) == epoch
 
     resumed = SkillLinkingSampler(**kwargs)
     resumed.load_state_dict({"epoch": 0, "start_index": 3})

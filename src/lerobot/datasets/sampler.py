@@ -160,7 +160,7 @@ class EpisodeAwareSampler:
 
 
 class SkillLinkingSampler(EpisodeAwareSampler):
-    """Sampler that alternates atomic and event-aligned starts for skill linking."""
+    """Sampler that draws atomic and event-aligned starts 75:25 for skill linking."""
 
     def __init__(
         self,
@@ -244,7 +244,8 @@ class SkillLinkingSampler(EpisodeAwareSampler):
             raise ValueError("SkillLinkingSampler found no atomic candidates.")
         if not self._event_candidates:
             raise ValueError("SkillLinkingSampler found no event candidates.")
-        self._num_frames = 2 * max(len(self._atomic_candidates), len(self._event_candidates))
+        num_groups = max(math.ceil(len(self._atomic_candidates) / 3), len(self._event_candidates))
+        self._num_frames = 4 * num_groups
 
     @property
     def atomic_candidates(self) -> list[int]:
@@ -321,11 +322,12 @@ class SkillLinkingSampler(EpisodeAwareSampler):
             event_order = list(range(len(self._event_candidates)))
 
         for position in range(start, self._num_frames):
-            pool_position = position // 2
-            if position % 2 == 0:
+            group_position, group_offset = divmod(position, 4)
+            if group_offset < 3:
+                pool_position = 3 * group_position + group_offset
                 absolute_idx = self._atomic_candidates[atomic_order[pool_position % len(atomic_order)]]
             else:
-                absolute_idx = self._event_candidates[event_order[pool_position % len(event_order)]]
+                absolute_idx = self._event_candidates[event_order[group_position % len(event_order)]]
             yield self._to_dataset_index(absolute_idx)
 
     def __len__(self) -> int:
