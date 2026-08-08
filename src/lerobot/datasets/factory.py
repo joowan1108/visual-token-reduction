@@ -221,18 +221,15 @@ def make_dataset(
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
-) -> tuple[
-    LeRobotDataset | MultiLeRobotDataset,
-    LeRobotDataset | None,
-]:
-    """Create train and optional eval datasets by splitting episodes
-    based on eval_split.
+) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
+    """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held
-    out for evaluation.
+    The last ceil(n_episodes * eval_split) episodes per task are held out
+    for evaluation.
 
-    If eval_split == 0.0, returns:
-        (full_dataset, None)
+    Task grouping is determined from frame-level ``task_index``.
+    This supports datasets whose meta/episodes parquet does not contain
+    a ``tasks`` column.
     """
 
     full_dataset = make_dataset(cfg)
@@ -240,49 +237,141 @@ def make_train_eval_datasets(
     if cfg.dataset.eval_split == 0.0:
         return full_dataset, None
 
+    # ---------------------------------------------------------
+    # Determine which episode indices are being used.
+    # ---------------------------------------------------------
     base_episodes = (
         full_dataset.episodes
         if full_dataset.episodes is not None
         else list(range(full_dataset.num_episodes))
     )
 
-    episode_tasks = full_dataset.meta.episodes["tasks"]
+    base_episode_set = set(base_episodes)
 
-    task_to_episodes: dict[str, list[int]] = {}
+    # ---------------------------------------------------------
+    # Build episode -> task_index mapping from the frame-level
+    # Hugging Face dataset.
+    #
+    # Our dataset contains:
+    #
+    #   episode_index
+    #   task_index
+    #
+    # but meta/episodes does NOT contain:
+    #
+    #   tasks
+    #
+    # Therefore don't use:
+    #
+    #   full_dataset.meta.episodes["tasks"]
+    # ---------------------------------------------------------
+    hf_dataset = full_dataset.hf_dataset
+
+    if "episode_index" not in hf_dataset.column_names:
+        raise ValueError(
+            "Dataset does not contain frame-level 'episode_index'. "
+            f"Available columns: {hf_dataset.column_names}"
+        )
+
+    if "task_index" not in hf_dataset.column_names:
+        raise ValueError(
+            "Dataset does not contain frame-level 'task_index'. "
+            f"Available columns: {hf_dataset.column_names}"
+        )
+
+    frame_episode_indices = hf_dataset["episode_index"]
+    frame_task_indices = hf_dataset["task_index"]
+
+    episode_to_task: dict[int, int] = {}
+
+    for ep_idx, task_idx in zip(
+        frame_episode_indices,
+        frame_task_indices,
+        strict=True,
+    ):
+        ep_idx = int(ep_idx)
+        task_idx = int(task_idx)
+
+        if ep_idx not in base_episode_set:
+            continue
+
+        # LIBERO task_index should be constant inside one episode.
+        # We only need the first frame to determine the episode's task.
+        if ep_idx not in episode_to_task:
+            episode_to_task[ep_idx] = task_idx
+
+    # ---------------------------------------------------------
+    # Ensure every selected episode has a task_index.
+    # ---------------------------------------------------------
+    missing_episodes = [
+        ep_idx
+        for ep_idx in base_episodes
+        if ep_idx not in episode_to_task
+    ]
+
+    if missing_episodes:
+        raise ValueError(
+            "Could not determine task_index for some episodes. "
+            f"Missing episodes: {missing_episodes[:20]}"
+            + (
+                f" ... ({len(missing_episodes)} total)"
+                if len(missing_episodes) > 20
+                else ""
+            )
+        )
+
+    # ---------------------------------------------------------
+    # Group episodes by high-level LIBERO task_index.
+    # ---------------------------------------------------------
+    task_to_episodes: dict[int, list[int]] = {}
 
     for ep_idx in base_episodes:
-        task_key = (
-            episode_tasks[ep_idx][0]
-            if episode_tasks[ep_idx]
-            else ""
-        )
+        task_idx = episode_to_task[ep_idx]
+        task_to_episodes.setdefault(task_idx, []).append(ep_idx)
 
-        task_to_episodes.setdefault(
-            task_key,
-            [],
-        ).append(ep_idx)
+    # ---------------------------------------------------------
+    # Per-task train/eval split.
+    #
+    # Example:
+    #
+    # task 0: 50 episodes, eval_split=0.1
+    #     -> train 45
+    #     -> eval 5
+    #
+    # This prevents some LIBERO tasks from disappearing entirely
+    # from the evaluation split.
+    # ---------------------------------------------------------
+    train_episodes: list[int] = []
+    eval_episodes: list[int] = []
 
-    train_episodes = []
-    eval_episodes = []
+    for task_idx, eps in sorted(task_to_episodes.items()):
+        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
 
-    for eps in task_to_episodes.values():
-        n_eval = math.ceil(
-            len(eps) * cfg.dataset.eval_split
-        )
+        # Make sure at least one training episode remains.
+        if n_eval >= len(eps):
+            raise ValueError(
+                f"Task {task_idx} has only {len(eps)} episodes, "
+                f"but eval_split={cfg.dataset.eval_split} would leave "
+                "no training episode."
+            )
 
-        train_episodes.extend(
-            eps[: len(eps) - n_eval]
-        )
+        train_eps = eps[: len(eps) - n_eval]
+        eval_eps = eps[len(eps) - n_eval :]
 
-        eval_episodes.extend(
-            eps[len(eps) - n_eval :]
+        train_episodes.extend(train_eps)
+        eval_episodes.extend(eval_eps)
+
+        logging.info(
+            f"Task {task_idx}: "
+            f"{len(eps)} total -> "
+            f"{len(train_eps)} train / "
+            f"{len(eval_eps)} eval"
         )
 
     if not train_episodes:
         raise ValueError(
             f"eval_split={cfg.dataset.eval_split} leaves "
-            f"0 training episodes from "
-            f"{len(base_episodes)} total."
+            f"0 training episodes from {len(base_episodes)} total."
         )
 
     logging.info(
@@ -293,6 +382,13 @@ def make_train_eval_datasets(
         f"{len(task_to_episodes)} tasks)"
     )
 
+    # Sort to keep deterministic episode ordering.
+    train_episodes = sorted(train_episodes)
+    eval_episodes = sorted(eval_episodes)
+
+    # ---------------------------------------------------------
+    # Resolve delta timestamps.
+    # ---------------------------------------------------------
     delta_timestamps = resolve_delta_timestamps(
         cfg.trainable_config,
         full_dataset.meta,
@@ -304,6 +400,9 @@ def make_train_eval_datasets(
         else None
     )
 
+    # ---------------------------------------------------------
+    # Create train dataset.
+    # ---------------------------------------------------------
     train_dataset = LeRobotDataset(
         cfg.dataset.repo_id,
         root=cfg.dataset.root,
@@ -316,6 +415,9 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
     )
 
+    # ---------------------------------------------------------
+    # Create eval dataset.
+    # ---------------------------------------------------------
     eval_dataset = LeRobotDataset(
         cfg.dataset.repo_id,
         root=cfg.dataset.root,
@@ -329,17 +431,19 @@ def make_train_eval_datasets(
     )
 
     # ---------------------------------------------------------
-    # train_dataset / eval_dataset are newly constructed above,
-    # so their meta.stats also need camera-key initialization.
+    # Apply ImageNet stats.
+    #
+    # Camera keys may not exist in meta/stats.json, so initialize
+    # them first with setdefault().
     # ---------------------------------------------------------
     if cfg.dataset.use_imagenet_stats:
         for ds in (train_dataset, eval_dataset):
             for key in ds.meta.camera_keys:
                 if key in ds.meta.depth_keys:
-                    continue  # Exclude depth keys from ImageNet stats
+                    continue
 
-                # FIX:
-                # stats.json may not contain image keys.
+                # Important:
+                # meta/stats.json may not contain image statistics.
                 ds.meta.stats.setdefault(key, {})
 
                 for stats_type, stats in IMAGENET_STATS.items():
