@@ -222,6 +222,8 @@ def test_batch_to_transition_with_index_fields():
         "task": ["pick_cube"],
         "index": torch.tensor([42], dtype=torch.int64),
         "task_index": torch.tensor([3], dtype=torch.int64),
+        "frame_index": torch.tensor([7], dtype=torch.int64),
+        "subtask_index": torch.tensor([[4, 4]], dtype=torch.int64),
     }
 
     transition = batch_to_transition(batch)
@@ -235,11 +237,15 @@ def test_batch_to_transition_with_index_fields():
     comp_data = transition[TransitionKey.COMPLEMENTARY_DATA]
     assert "index" in comp_data
     assert "task_index" in comp_data
+    assert "frame_index" in comp_data
+    assert "subtask_index" in comp_data
     assert "task" in comp_data
 
     # Verify values
     assert torch.equal(comp_data["index"], batch["index"])
     assert torch.equal(comp_data["task_index"], batch["task_index"])
+    assert torch.equal(comp_data["frame_index"], batch["frame_index"])
+    assert torch.equal(comp_data["subtask_index"], batch["subtask_index"])
     assert comp_data["task"] == batch["task"]
 
 

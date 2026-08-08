@@ -213,6 +213,7 @@ def test_select_action_applies_pending_skill_after_exact_horizon(monkeypatch):
         skill_linking_enabled=True,
         skill_linking_num_skills=16,
         n_action_steps=2,
+        rtc_config=None,
     )
     policy._queues = {ACTION: deque(maxlen=2)}
     policy._current_skill = 16
