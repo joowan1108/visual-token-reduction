@@ -494,3 +494,19 @@ def test_focus_token_visualizers_preserve_selector_overlays_and_render_smooth_co
         assert composite.size == (64, 200)
         panel = composite.crop((0, 168, 32, 200))
         assert len(panel.getcolors(maxcolors=32 * 32)) > 8
+
+    titled_dir = tmp_path / "titled_composites"
+    assert (
+        render_composites(
+            jsonl_path,
+            titled_dir,
+            variant="focus50",
+            suite="libero_10",
+            task_id=3,
+            task_instruction="put both mugs on their corresponding plates",
+        )
+        == 4
+    )
+    with Image.open(next(titled_dir.glob("*.png"))) as composite:
+        assert composite.width == 64
+        assert composite.height > 200

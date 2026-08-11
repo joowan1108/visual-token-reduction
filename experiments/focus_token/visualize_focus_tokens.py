@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import textwrap
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -167,7 +168,15 @@ def _selection_overlay(record: dict, jsonl_path: Path) -> Image.Image:
     return Image.alpha_composite(source, overlay).convert("RGB")
 
 
-def render_composites(jsonl_path: Path, output_dir: Path) -> int:
+def render_composites(
+    jsonl_path: Path,
+    output_dir: Path,
+    *,
+    variant: str | None = None,
+    suite: str | None = None,
+    task_id: int | None = None,
+    task_instruction: str | None = None,
+) -> int:
     """Render first-call final-step originals, Top-K masks, and expert-attention heatmaps."""
     records = [
         json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()
@@ -218,18 +227,35 @@ def render_composites(jsonl_path: Path, output_dir: Path) -> int:
             if any(panel.size != (panel_width, panel_height) for panel in originals + selections + heatmaps):
                 raise ValueError("All camera images must have the same dimensions")
 
+            title_lines = [f"call={call_index} | flow={denoising_step} | cross layer={layer}"]
+            context = " | ".join(
+                value
+                for value in (
+                    f"variant={variant}" if variant else None,
+                    f"suite={suite}" if suite else None,
+                    f"task={task_id}" if task_id is not None else None,
+                )
+                if value is not None
+            )
+            if context:
+                title_lines.insert(0, context)
+            if task_instruction:
+                title_lines.extend(
+                    textwrap.wrap(
+                        f"Instruction: {task_instruction}",
+                        width=max(20, len(CAMERAS) * panel_width // 6),
+                    )
+                )
+            title_height = TITLE_HEIGHT if len(title_lines) == 1 else 8 + 14 * len(title_lines)
             row_height = panel_height + LABEL_HEIGHT
             composite = Image.new(
                 "RGB",
-                (len(CAMERAS) * panel_width, TITLE_HEIGHT + 3 * row_height),
+                (len(CAMERAS) * panel_width, title_height + 3 * row_height),
                 "white",
             )
             draw = ImageDraw.Draw(composite)
-            draw.text(
-                (4, 8),
-                f"call={call_index} | flow={denoising_step} | cross layer={layer}",
-                fill="black",
-            )
+            for line_index, line in enumerate(title_lines):
+                draw.text((4, 6 + 14 * line_index), line, fill="black")
             rows = (originals, selections, heatmaps)
             for column, camera in enumerate(CAMERAS):
                 record = layer_records[column]
@@ -246,7 +272,7 @@ def render_composites(jsonl_path: Path, output_dir: Path) -> int:
                 )
                 for row, panels in enumerate(rows):
                     x = column * panel_width
-                    y = TITLE_HEIGHT + row * row_height
+                    y = title_height + row * row_height
                     draw.text((x + 4, y + 4), labels[row], fill="black")
                     composite.paste(panels[column], (x, y + LABEL_HEIGHT))
 
@@ -265,6 +291,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render SmolVLA focus-token diagnostics.")
     parser.add_argument("jsonl", type=Path, help="Focus-token diagnostics JSONL")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--variant")
+    parser.add_argument("--suite")
+    parser.add_argument("--task-id", type=int)
+    parser.add_argument("--task-instruction")
     parser.add_argument(
         "--composite",
         action="store_true",
@@ -272,7 +302,15 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.composite:
-        print(f"Rendered {render_composites(args.jsonl, args.output_dir)} composites to {args.output_dir}")
+        rendered = render_composites(
+            args.jsonl,
+            args.output_dir,
+            variant=args.variant,
+            suite=args.suite,
+            task_id=args.task_id,
+            task_instruction=args.task_instruction,
+        )
+        print(f"Rendered {rendered} composites to {args.output_dir}")
     else:
         print(f"Rendered {render_overlays(args.jsonl, args.output_dir)} overlays to {args.output_dir}")
 
