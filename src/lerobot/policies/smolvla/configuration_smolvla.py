@@ -103,6 +103,10 @@ class SmolVLAConfig(PreTrainedConfig):
     focus_token_diagnostics_path: str | None = None
     focus_cascaded_attention: bool = False
     focus_channel_gate: bool = False
+    attention_map: bool = False
+    attention_map_output_dir: str | None = None
+    attention_map_layers: list[int] = field(default_factory=lambda: [-4, -3, -2, -1])
+    attention_map_flow_steps: list[int] = field(default_factory=lambda: [-1])
 
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
@@ -132,6 +136,18 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`focus_token_start_layer` must index a VLM layer.")
         if self.focus_channel_gate and not self.focus_cascaded_attention:
             raise ValueError("`focus_channel_gate=True` requires `focus_cascaded_attention=True`.")
+        if self.attention_map:
+            if not self.attention_map_output_dir:
+                raise ValueError("`attention_map_output_dir` is required when `attention_map=True`.")
+            if not self.attention_map_layers or not self.attention_map_flow_steps:
+                raise ValueError("Attention-map layers and flow steps must not be empty.")
+            if any(
+                not -self.num_vlm_layers <= layer < self.num_vlm_layers
+                for layer in self.attention_map_layers
+            ):
+                raise ValueError("`attention_map_layers` contains an out-of-range layer index.")
+            if self.compile_model:
+                raise ValueError("Attention-map capture requires `compile_model=False`.")
         if self.focus_token_keep_ratio < 1 or self.focus_cascaded_attention:
             if (
                 self.num_vlm_layers != 16

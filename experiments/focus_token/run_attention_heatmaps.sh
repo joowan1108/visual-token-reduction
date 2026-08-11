@@ -76,6 +76,10 @@ for VARIANT in "${VARIANTS[@]}"; do
         --policy.focus_cascaded_attention="$CASCADED" \
         --policy.focus_channel_gate="$GATE" \
         --policy.focus_token_diagnostics_path="$RUN/attention.jsonl" \
+        --policy.attention_map=true \
+        --policy.attention_map_output_dir="$RUN/attention_maps_rank0" \
+        --policy.attention_map_layers='[-4,-3,-2,-1]' \
+        --policy.attention_map_flow_steps='[-1]' \
         --env.type=libero \
         --env.task="$SUITE" \
         --env.task_ids="[$TASK_ID]" \
@@ -98,6 +102,9 @@ for VARIANT in "${VARIANTS[@]}"; do
         --task-id "$TASK_ID" \
         --task-instruction "$TASK_INSTRUCTION" \
         --composite
+      visualize_smolvla_attention \
+        "$RUN/attention_maps_rank0" \
+        --output-dir "$RUN/attention_overlays"
     done
   done
 done

@@ -297,3 +297,15 @@ not run here. No raw result, dependency, or unrelated untracked file was modifie
 - The requested 3-row by 2-camera composite remains. Its two camera heatmaps share one scale within
   each batch/layer image; the label explicitly calls this camera-relative, so it is not evidence for
   cross-layer or cross-variant intensity differences.
+
+## Global Focus budget and probability-map amendment (2026-08-11)
+
+- Legacy Focus now applies one `ceil(keep_ratio * total_valid_visual_tokens)` Top-K budget across all
+  cameras. It no longer reserves 50% independently for every camera; nonvisual tokens remain dense.
+- Attention maps now come from the actual post-mask multi-head softmax probabilities. Head and action
+  query dimensions are averaged, selected layers are averaged, and pruned patches are restored as zero
+  at their original image-grid positions.
+- Raw maps, model-input images, and task descriptions are saved as `call_*_flow_*_{cross,self}.npz`.
+  The `visualize_smolvla_attention` command renders task-labeled, shared-scale jet overlays.
+- This is a post-result intervention amendment. Existing per-camera Focus50 results remain results of
+  the old method and must not be relabeled as global-budget results.

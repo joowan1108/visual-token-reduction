@@ -12,12 +12,14 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torch import nn
 
 from experiments.focus_token.visualize_focus_tokens import render_composites, render_overlays
+from lerobot.policies.smolvla.attention_analysis import AttentionMapCollector
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMWithExpertModel,
@@ -25,6 +27,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
     _select_visual_tokens,
     _uses_cascaded_focus_layer,
 )
+from lerobot.scripts.visualize_smolvla_attention import render_attention_maps
 
 
 def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape():
@@ -33,6 +36,7 @@ def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape()
     assert config.focus_token_diagnostics_path is None
     assert not config.focus_cascaded_attention
     assert not config.focus_channel_gate
+    assert not config.attention_map
 
     with pytest.raises(ValueError, match="keep_ratio"):
         SmolVLAConfig(focus_token_keep_ratio=0)
@@ -42,6 +46,8 @@ def test_focus_token_config_preserves_dense_default_and_validates_sparse_shape()
         SmolVLAConfig(focus_token_keep_ratio=0.5, compile_model=True)
     with pytest.raises(ValueError, match="requires"):
         SmolVLAConfig(focus_channel_gate=True)
+    with pytest.raises(ValueError, match="output_dir"):
+        SmolVLAConfig(attention_map=True, compile_model=False)
 
 
 def test_per_query_global_topk_selects_exact_and_different_visual_patches():
@@ -66,7 +72,7 @@ def test_per_query_global_topk_uses_per_query_valid_ceil_budget():
     assert not (selected & ~mask).any()
 
 
-def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order():
+def test_select_visual_tokens_uses_one_global_visual_budget_and_restores_order():
     query = torch.ones(2, 1, 1, 1)
     keys = torch.arange(10, dtype=torch.float32).view(1, 10, 1, 1).expand(2, -1, -1, -1)
     values = keys.clone()
@@ -79,26 +85,30 @@ def test_select_visual_tokens_uses_independent_ceil_budgets_and_restores_order()
         query, keys, values, mask, ((1, 5), (6, 9)), 0.5, diagnostics
     )
 
-    torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 3, 4, 5, 8, 9.0]))
+    torch.testing.assert_close(selected_keys[0, :, 0, 0], torch.tensor([0, 4, 5, 7, 8, 9.0]))
     torch.testing.assert_close(selected_values, selected_keys)
-    assert original_indices[0].tolist() == [0, 3, 4, 5, 8, 9]
+    assert original_indices[0].tolist() == [0, 4, 5, 7, 8, 9]
     assert selected_mask[0, 0].tolist() == [True] * 6
     torch.testing.assert_close(selected_keys[1, :5, 0, 0], torch.tensor([0, 3, 4, 5, 9.0]))
     assert selected_mask[1, 0].tolist() == [True, True, True, True, True, False]
     first_camera = diagnostics[0]
     assert first_camera["valid_token_count"] == 4
-    assert first_camera["selected_token_count"] == 2
-    assert first_camera["selected_indices"] == [2, 3]
-    assert first_camera["selected_prefix_indices"] == [3, 4]
-    expected_distribution = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0]), dim=0)
-    torch.testing.assert_close(torch.tensor(first_camera["attention_distribution"]), expected_distribution)
-    expected_mass = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0]), dim=0)[-2:].sum()
-    assert first_camera["topk_attention_mass"] == pytest.approx(expected_mass.item())
+    assert first_camera["selected_token_count"] == 1
+    assert first_camera["selected_indices"] == [3]
+    assert first_camera["selected_prefix_indices"] == [4]
+    expected_distribution = torch.softmax(torch.tensor([1.0, 2.0, 3.0, 4.0, 7.0, 8.0]), dim=0)
+    torch.testing.assert_close(
+        torch.tensor(first_camera["attention_distribution"]), expected_distribution[:4]
+    )
+    assert first_camera["topk_attention_mass"] == pytest.approx(expected_distribution[3].item())
     assert first_camera["topk_attention_mass"] == pytest.approx(
         sum(first_camera["attention_distribution"][index] for index in first_camera["selected_indices"])
     )
     assert diagnostics[2]["attention_distribution"][0] == 0.0
-    assert sum(diagnostics[2]["attention_distribution"]) == pytest.approx(1.0)
+    assert diagnostics[2]["selected_token_count"] == 2
+    assert sum(first_camera["attention_distribution"]) + sum(
+        diagnostics[2]["attention_distribution"]
+    ) == pytest.approx(1.0)
     assert diagnostics[3]["valid_token_count"] == 0
     assert diagnostics[3]["selected_indices"] == []
     assert diagnostics[3]["attention_distribution"] == [0.0, 0.0, 0.0]
@@ -416,8 +426,8 @@ def test_focus_token_diagnostics_are_opt_in_and_align_calls_with_images(monkeypa
     assert records[0]["image_path"] != records[1]["image_path"]
     assert records[0]["image_path"] != records[2]["image_path"]
     assert records[0]["valid_token_count"] == 4
-    assert records[0]["selected_token_count"] == 2
-    assert 0 < records[0]["topk_attention_mass"] <= 1
+    assert records[0]["selected_token_count"] + records[1]["selected_token_count"] == 4
+    assert 0 < records[0]["topk_attention_mass"] + records[1]["topk_attention_mass"] <= 1
     assert len(records[0]["action_visual_attention_distribution"]) == records[0]["valid_token_count"]
     assert records[0]["action_visual_attention_mass"] == pytest.approx(
         sum(records[0]["action_visual_attention_distribution"])
@@ -510,3 +520,48 @@ def test_focus_token_visualizers_preserve_selector_overlays_and_render_smooth_co
     with Image.open(next(titled_dir.glob("*.png"))) as composite:
         assert composite.width == 64
         assert composite.height > 200
+
+
+def test_attention_map_collector_averages_actual_probs_and_renders_npz(tmp_path):
+    collector = AttentionMapCollector(tmp_path / "maps", 4, [-2, -1], [-1])
+    images = [torch.full((1, 3, 2, 2), -1.0), torch.full((1, 3, 2, 2), 1.0)]
+    original_indices = torch.tensor([[0, 2, 4, 6]])
+    collector.start_call(images, ((0, 4), (4, 8)), ["pick up the black bowl"])
+    collector.set_flow_step(8)
+    collector.collect(
+        torch.tensor([[[[0.25, 0.25, 0.25, 0.25]]]]),
+        layer=2,
+        attention_kind="cross",
+        original_indices=original_indices,
+        scope="total_prefix",
+    )
+    collector.set_flow_step(9)
+    collector.collect(
+        torch.tensor([[[[0.1, 0.2, 0.3, 0.4]]]]),
+        layer=2,
+        attention_kind="cross",
+        original_indices=original_indices,
+        scope="total_prefix",
+    )
+    collector.collect(
+        torch.tensor([[[[0.2, 0.1, 0.4, 0.3]]]]),
+        layer=3,
+        attention_kind="cross",
+        original_indices=original_indices,
+        scope="total_prefix",
+    )
+
+    outputs = collector.end_call()
+
+    assert [path.name for path in outputs] == ["call_000000_flow_009_cross.npz"]
+    with np.load(outputs[0], allow_pickle=False) as data:
+        assert data["layers"].tolist() == [2, 3]
+        assert data["task_descriptions"].tolist() == ["pick up the black bowl"]
+        assert data["attention_maps"].shape == (1, 2, 4)
+        np.testing.assert_allclose(data["attention_maps"][0, 0], [0.15, 0.0, 0.15, 0.0])
+        np.testing.assert_allclose(data["attention_maps"][0, 1], [0.35, 0.0, 0.35, 0.0])
+
+    output_dir = tmp_path / "overlays"
+    assert render_attention_maps(tmp_path / "maps", output_dir) == 1
+    with Image.open(next(output_dir.glob("*.png"))) as overlay:
+        assert overlay.size == (4, 92)

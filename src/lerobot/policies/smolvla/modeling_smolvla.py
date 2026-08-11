@@ -210,7 +210,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            task_descriptions=batch.get("task"),
+            **kwargs,
         )
 
         # Unpad actions
@@ -508,6 +515,10 @@ class VLAFlowMatching(nn.Module):
             focus_token_diagnostics_path=self.config.focus_token_diagnostics_path,
             focus_cascaded_attention=self.config.focus_cascaded_attention,
             focus_channel_gate=self.config.focus_channel_gate,
+            attention_map=self.config.attention_map,
+            attention_map_output_dir=self.config.attention_map_output_dir,
+            attention_map_layers=self.config.attention_map_layers,
+            attention_map_flow_steps=self.config.attention_map_flow_steps,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
@@ -740,6 +751,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        task_descriptions: list[str] | tuple[str, ...] | str | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -765,6 +777,7 @@ class VLAFlowMatching(nn.Module):
         )
         num_steps = self.config.num_steps
         self.vlm_with_expert.start_focus_token_diagnostics_call(images)
+        self.vlm_with_expert.start_attention_map_call(images, visual_token_spans, task_descriptions)
         try:
             return euler_integrate(
                 lambda input_x_t, current_timestep: self.denoise_step(
@@ -783,6 +796,7 @@ class VLAFlowMatching(nn.Module):
                 execution_horizon=kwargs.get("execution_horizon"),
             )
         finally:
+            self.vlm_with_expert.end_attention_map_call()
             self.vlm_with_expert.end_focus_token_diagnostics_call()
 
     def denoise_step(
@@ -794,12 +808,18 @@ class VLAFlowMatching(nn.Module):
         visual_token_spans,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        if self.vlm_with_expert.focus_token_diagnostics_path is not None:
+        if (
+            self.vlm_with_expert.focus_token_diagnostics_path is not None
+            or getattr(self.vlm_with_expert, "attention_map_collector", None) is not None
+        ):
             timestep_value = float(timestep[0].item())
-            self.vlm_with_expert.focus_token_diagnostics_context.update(
-                denoising_step=round((1.0 - timestep_value) * self.config.num_steps),
-                denoising_timestep=timestep_value,
-            )
+            denoising_step = round((1.0 - timestep_value) * self.config.num_steps)
+            if self.vlm_with_expert.focus_token_diagnostics_path is not None:
+                self.vlm_with_expert.focus_token_diagnostics_context.update(
+                    denoising_step=denoising_step,
+                    denoising_timestep=timestep_value,
+                )
+            self.vlm_with_expert.set_attention_map_flow_step(denoising_step)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]

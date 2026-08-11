@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from lerobot.policies.smolvla.attention_analysis import AttentionMapCollector
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
@@ -83,7 +84,7 @@ def _select_visual_tokens(
     keep_ratio: float,
     diagnostics: list[dict] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select visual K/V per camera and sample while retaining every non-visual position."""
+    """Select visual K/V globally per sample while retaining every non-visual position."""
     batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
     num_query_heads = query_states.shape[2]
     key_for_scores = key_states.repeat_interleave(num_query_heads // num_key_value_heads, dim=2)
@@ -91,45 +92,40 @@ def _select_visual_tokens(
         query_states.shape[1] * num_query_heads * math.sqrt(head_dim)
     )
 
+    visual_positions = torch.cat(
+        [torch.arange(start, end, device=key_states.device) for start, end in visual_token_spans]
+    )
     keep = torch.ones(batch_size, prefix_len, dtype=torch.bool, device=key_states.device)
-    for camera_idx, (start, end) in enumerate(visual_token_spans):
-        keep[:, start:end] = False
-        valid = attention_mask[:, :, start:end].any(dim=1)
-        for batch_idx in range(batch_size):
-            valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
-            if valid_indices.numel() == 0:
-                if diagnostics is not None:
-                    diagnostics.append(
-                        {
-                            "batch_index": batch_idx,
-                            "camera": camera_idx,
-                            "valid_token_count": 0,
-                            "selected_token_count": 0,
-                            "selected_indices": [],
-                            "selected_prefix_indices": [],
-                            "attention_distribution": [0.0] * (end - start),
-                            "topk_attention_mass": 0.0,
-                        }
-                    )
-                continue
-            count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
-            camera_scores = scores[batch_idx, start:end][valid_indices]
-            selected = valid_indices[torch.topk(camera_scores, count, sorted=False).indices] + start
-            keep[batch_idx, selected] = True
-            if diagnostics is not None:
-                selected = selected.sort().values
-                attention_distribution = torch.zeros(end - start, device=camera_scores.device)
-                attention_distribution[valid_indices] = camera_scores.softmax(dim=0)
+    keep[:, visual_positions] = False
+    valid = attention_mask.index_select(2, visual_positions).any(dim=1)
+    selector_distribution = torch.zeros(batch_size, visual_positions.numel(), device=key_states.device)
+    for batch_idx in range(batch_size):
+        valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
+        if valid_indices.numel() == 0:
+            continue
+        count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
+        visual_scores = scores[batch_idx, visual_positions][valid_indices]
+        selected_visual = valid_indices[torch.topk(visual_scores, count, sorted=False).indices]
+        keep[batch_idx, visual_positions[selected_visual]] = True
+        selector_distribution[batch_idx, valid_indices] = visual_scores.softmax(dim=0)
+
+    if diagnostics is not None:
+        for camera_idx, (start, end) in enumerate(visual_token_spans):
+            camera_positions = (visual_positions >= start) & (visual_positions < end)
+            for batch_idx in range(batch_size):
+                camera_valid = valid[batch_idx, camera_positions]
+                selected = torch.nonzero(keep[batch_idx, start:end], as_tuple=False).squeeze(1)
+                distribution = selector_distribution[batch_idx, camera_positions]
                 diagnostics.append(
                     {
                         "batch_index": batch_idx,
                         "camera": camera_idx,
-                        "valid_token_count": int(valid_indices.numel()),
-                        "selected_token_count": count,
-                        "selected_indices": (selected - start).tolist(),
-                        "selected_prefix_indices": selected.tolist(),
-                        "attention_distribution": attention_distribution.tolist(),
-                        "topk_attention_mass": float(attention_distribution[selected - start].sum().item()),
+                        "valid_token_count": int(camera_valid.sum().item()),
+                        "selected_token_count": int(selected.numel()),
+                        "selected_indices": selected.tolist(),
+                        "selected_prefix_indices": (selected + start).tolist(),
+                        "attention_distribution": distribution.tolist(),
+                        "topk_attention_mass": float(distribution[selected].sum().item()),
                     }
                 )
 
@@ -236,6 +232,10 @@ class SmolVLMWithExpertModel(nn.Module):
         focus_token_diagnostics_path: str | None = None,
         focus_cascaded_attention: bool = False,
         focus_channel_gate: bool = False,
+        attention_map: bool = False,
+        attention_map_output_dir: str | None = None,
+        attention_map_layers: list[int] | None = None,
+        attention_map_flow_steps: list[int] | None = None,
         device: str = "auto",
     ):
         super().__init__()
@@ -336,6 +336,17 @@ class SmolVLMWithExpertModel(nn.Module):
         self._focus_token_attention_diagnostics = None
         if focus_token_diagnostics_path is not None:
             self.enable_focus_token_diagnostics(focus_token_diagnostics_path)
+        self.attention_map_collector = (
+            AttentionMapCollector(
+                attention_map_output_dir,
+                self.num_vlm_layers,
+                attention_map_layers or [-4, -3, -2, -1],
+                attention_map_flow_steps or [-1],
+            )
+            if attention_map
+            else None
+        )
+        self._attention_map_context = None
         self.set_requires_grad()
 
     def enable_focus_token_diagnostics(self, path, **context):
@@ -398,6 +409,18 @@ class SmolVLMWithExpertModel(nn.Module):
     def end_focus_token_diagnostics_call(self):
         self.focus_token_diagnostics_image_paths = {}
 
+    def start_attention_map_call(self, images, visual_token_spans, task_descriptions=None):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.start_call(images, visual_token_spans, task_descriptions)
+
+    def set_attention_map_flow_step(self, flow_step):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.set_flow_step(flow_step)
+
+    def end_attention_map_call(self):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.end_call()
+
     def _write_focus_token_diagnostics(self, layer_idx, records):
         with self.focus_token_diagnostics_path.open("a", encoding="utf-8") as output:
             for record in records:
@@ -417,6 +440,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
 
     def _capture_action_visual_attention(self, probs):
+        if (
+            getattr(self, "attention_map_collector", None) is not None
+            and getattr(self, "_attention_map_context", None) is not None
+        ):
+            self.attention_map_collector.collect(probs, **self._attention_map_context)
+
         capture = getattr(self, "_focus_token_attention_diagnostics", None)
         if capture is None:
             return
@@ -443,6 +472,42 @@ class SmolVLMWithExpertModel(nn.Module):
             else:
                 record["total_prefix_camera_attention_mass"] = mass
             record["action_visual_attention_distribution"] = distribution.tolist()
+
+    def _attention_with_map(
+        self,
+        attention_interface,
+        attention_mask,
+        batch_size,
+        head_dim,
+        query_states,
+        key_states,
+        value_states,
+        *,
+        layer,
+        attention_kind,
+        original_indices,
+        scope,
+    ):
+        if (
+            getattr(self, "attention_map_collector", None) is None
+            or not self.attention_map_collector.active
+        ):
+            return attention_interface(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+        previous = self._attention_map_context
+        self._attention_map_context = {
+            "layer": layer,
+            "attention_kind": attention_kind,
+            "original_indices": original_indices,
+            "scope": scope,
+        }
+        try:
+            return attention_interface(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+        finally:
+            self._attention_map_context = previous
 
     def get_vlm_model(self):
         return self.vlm.model
@@ -580,8 +645,20 @@ class SmolVLMWithExpertModel(nn.Module):
 
         attention_interface = self.get_attention_interface()
 
-        att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+        att_output = self._attention_with_map(
+            attention_interface,
+            attention_mask_,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            layer=layer_idx,
+            attention_kind="self",
+            original_indices=torch.arange(key_states.shape[1], device=key_states.device).expand(
+                batch_size, -1
+            ),
+            scope="total_sequence",
         )
         return [att_output], past_key_values
 
@@ -735,13 +812,18 @@ class SmolVLMWithExpertModel(nn.Module):
                         diagnostics,
                     )
                 try:
-                    visual_output = attention_interface(
+                    visual_output = self._attention_with_map(
+                        attention_interface,
                         visual_mask,
                         batch_size,
                         head_dim,
                         expert_query_states,
                         visual_keys,
                         visual_values,
+                        layer=layer_idx,
+                        attention_kind="cross",
+                        original_indices=visual_positions.expand(batch_size, -1),
+                        scope="visual_branch",
                     )
                     visual_output *= visual_mask.any(dim=-1, keepdim=True).to(visual_output.dtype)
                 finally:
@@ -826,13 +908,18 @@ class SmolVLMWithExpertModel(nn.Module):
                     diagnostics,
                 )
             try:
-                att_output = attention_interface(
+                att_output = self._attention_with_map(
+                    attention_interface,
                     expert_attention_mask,
                     batch_size,
                     head_dim,
                     expert_query_states,
                     expert_key_states,
                     expert_value_states,
+                    layer=layer_idx,
+                    attention_kind="cross",
+                    original_indices=original_prefix_indices,
+                    scope="total_prefix",
                 )
             finally:
                 self._focus_token_attention_diagnostics = None
