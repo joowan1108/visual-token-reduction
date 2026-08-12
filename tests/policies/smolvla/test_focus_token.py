@@ -21,6 +21,7 @@ from torch import nn
 from experiments.focus_token.visualize_focus_tokens import render_composites, render_overlays
 from lerobot.policies.smolvla.attention_analysis import AttentionMapCollector
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import VLAFlowMatching
 from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMWithExpertModel,
     _per_query_visual_topk_mask,
@@ -112,6 +113,40 @@ def test_select_visual_tokens_uses_one_global_visual_budget_and_restores_order()
     assert diagnostics[3]["valid_token_count"] == 0
     assert diagnostics[3]["selected_indices"] == []
     assert diagnostics[3]["attention_distribution"] == [0.0, 0.0, 0.0]
+
+
+def test_focus_topk_only_applies_to_low_noise_samples():
+    schedule = torch.tensor([1.0 - step / 10 for step in range(10)])
+    holder = SimpleNamespace(config=SimpleNamespace(num_steps=10))
+    assert VLAFlowMatching._focus_token_sparse_samples(holder, schedule).tolist() == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+
+    query = torch.ones(2, 1, 1, 1)
+    keys = torch.arange(8, dtype=torch.float32).view(1, 8, 1, 1).expand(2, -1, -1, -1)
+    mask = torch.ones(2, 1, 8, dtype=torch.bool)
+
+    _, _, selected_mask, original_indices = _select_visual_tokens(
+        query,
+        keys,
+        keys,
+        mask,
+        ((0, 8),),
+        0.5,
+        sparse_samples=torch.tensor([False, True]),
+    )
+
+    assert selected_mask.sum(dim=-1).tolist() == [[8], [4]]
+    assert original_indices[0].tolist() == list(range(8))
 
 
 class _FakeAttention:

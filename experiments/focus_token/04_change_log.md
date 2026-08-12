@@ -309,3 +309,9 @@ not run here. No raw result, dependency, or unrelated untracked file was modifie
   The `visualize_smolvla_attention` command renders task-labeled, shared-scale jet overlays.
 - This is a post-result intervention amendment. Existing per-camera Focus50 results remain results of
   the old method and must not be relabeled as global-budget results.
+
+## Low-noise Focus amendment (2026-08-12)
+
+- Legacy Focus applies global visual Top-K only when `t <= 3 / num_steps`: the final three iterations
+  of the default 10-step denoising schedule. Earlier iterations remain dense.
+- Training uses the same per-sample timestep condition, while Dense and Cascaded paths are unchanged.

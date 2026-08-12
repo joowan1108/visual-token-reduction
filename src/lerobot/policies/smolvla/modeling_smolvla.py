@@ -565,6 +565,9 @@ class VLAFlowMatching(nn.Module):
     def sample_time(self, bsize, device):
         return sample_time_beta(bsize, device, alpha=1.5, beta=1.0, scale=0.999, offset=0.001)
 
+    def _focus_token_sparse_samples(self, timestep: torch.Tensor) -> torch.Tensor:
+        return timestep <= 3 / self.config.num_steps
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[tuple[int, int], ...]]:
@@ -735,6 +738,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             visual_token_spans=visual_token_spans,
+            focus_token_sparse_samples=self._focus_token_sparse_samples(time),
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -840,6 +844,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             visual_token_spans=visual_token_spans,
+            focus_token_sparse_samples=self._focus_token_sparse_samples(timestep),
         )
         if past_key_values is not None:
             # Self-attention layers append suffix K/V in place; restore the prefix for the next step.

@@ -83,6 +83,7 @@ def _select_visual_tokens(
     visual_token_spans: tuple[tuple[int, int], ...],
     keep_ratio: float,
     diagnostics: list[dict] | None = None,
+    sparse_samples: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select visual K/V globally per sample while retaining every non-visual position."""
     batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
@@ -99,22 +100,29 @@ def _select_visual_tokens(
     keep[:, visual_positions] = False
     valid = attention_mask.index_select(2, visual_positions).any(dim=1)
     selector_distribution = torch.zeros(batch_size, visual_positions.numel(), device=key_states.device)
+    if sparse_samples is None:
+        sparse_samples = torch.ones(batch_size, dtype=torch.bool, device=key_states.device)
     for batch_idx in range(batch_size):
         valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
         if valid_indices.numel() == 0:
             continue
-        count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
         visual_scores = scores[batch_idx, visual_positions][valid_indices]
+        selector_distribution[batch_idx, valid_indices] = visual_scores.softmax(dim=0)
+        if not sparse_samples[batch_idx]:
+            keep[batch_idx, visual_positions] = True
+            continue
+        count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
         selected_visual = valid_indices[torch.topk(visual_scores, count, sorted=False).indices]
         keep[batch_idx, visual_positions[selected_visual]] = True
-        selector_distribution[batch_idx, valid_indices] = visual_scores.softmax(dim=0)
 
     if diagnostics is not None:
         for camera_idx, (start, end) in enumerate(visual_token_spans):
             camera_positions = (visual_positions >= start) & (visual_positions < end)
             for batch_idx in range(batch_size):
                 camera_valid = valid[batch_idx, camera_positions]
-                selected = torch.nonzero(keep[batch_idx, start:end], as_tuple=False).squeeze(1)
+                selected = torch.nonzero(
+                    keep[batch_idx, start:end] & camera_valid, as_tuple=False
+                ).squeeze(1)
                 distribution = selector_distribution[batch_idx, camera_positions]
                 diagnostics.append(
                     {
@@ -674,6 +682,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         past_key_values: "DynamicCache | None" = None,
         visual_token_spans: tuple[tuple[int, int], ...] | None = None,
+        focus_token_sparse_samples: torch.Tensor | None = None,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         attention_interface = self.get_attention_interface()
 
@@ -870,6 +879,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     visual_token_spans,
                     self.focus_token_keep_ratio,
                     diagnostics,
+                    focus_token_sparse_samples,
                 )
             else:
                 original_prefix_indices = torch.arange(
@@ -954,6 +964,7 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         visual_token_spans: tuple[tuple[int, int], ...] | None = None,
+        focus_token_sparse_samples: torch.Tensor | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -1004,6 +1015,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     past_key_values=past_key_values,
                     visual_token_spans=visual_token_spans,
+                    focus_token_sparse_samples=focus_token_sparse_samples,
                 )
             outputs_embeds = []
             start = 0
