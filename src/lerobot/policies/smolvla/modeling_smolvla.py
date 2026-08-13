@@ -52,7 +52,9 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import json
 import math
+import time
 from collections import deque
 from typing import TypedDict, Unpack
 
@@ -71,11 +73,45 @@ from ..common.vla_utils import (
     pad_vector,
     resize_with_pad,
 )
-from ..pretrained import PreTrainedPolicy
+from ..pretrained import PreTrainedPolicy, RolloutEpisodeFailure
 from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import populate_queues
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
+
+ATOMIC_SKILLS = ("pick", "place", "push", "turn", "open", "close")
+
+
+class AtomicPlannerEpisodeFailure(RolloutEpisodeFailure):
+    """The preregistered planner failure rule ended the current episode."""
+
+
+def parse_atomic_planner_output(raw_output: str, previous_skill: str | None) -> tuple[str, int]:
+    def unique_object(pairs):
+        output = dict(pairs)
+        if len(output) != len(pairs):
+            raise ValueError("Atomic planner JSON contains duplicate keys.")
+        return output
+
+    try:
+        parsed = json.loads(raw_output, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ValueError("Atomic planner output must be one strict JSON object.") from error
+    if not isinstance(parsed, dict) or set(parsed) != {"decision", "skill"}:
+        raise ValueError("Atomic planner JSON must contain exactly `decision` and `skill`.")
+    decision, skill = parsed["decision"], parsed["skill"]
+    if not isinstance(decision, str) or not isinstance(skill, str):
+        raise ValueError("Atomic planner decision and skill must be strings.")
+    if decision not in {"continue", "switch"} or skill not in ATOMIC_SKILLS:
+        raise ValueError("Atomic planner decision or skill is outside the allowed enum.")
+    if previous_skill is None and decision != "switch":
+        raise ValueError("The first atomic planner decision must be `switch`.")
+    if previous_skill is not None:
+        if decision == "continue" and skill != previous_skill:
+            raise ValueError("A `continue` decision must retain the previous skill.")
+        if decision == "switch" and skill == previous_skill:
+            raise ValueError("A `switch` decision must select a different skill.")
+    return decision, ATOMIC_SKILLS.index(skill)
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -83,6 +119,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
     current_skill: Tensor | None
+    current_phase: Tensor | None
+    atomic_skill_id: Tensor | None
 
 
 def _list_safetensor_keys(model_file: str, map_location: str) -> set[str]:
@@ -188,6 +226,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._current_skill = None
         self._pending_skill = None
         self._last_transition_prediction = None
+        self._current_phase = None
+        self._pending_phase = None
+        self._last_phase_prediction = None
+        self._atomic_planner_skill = None
+        self._atomic_planner_consecutive_failures = 0
+        self.atomic_planner_history = []
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -220,18 +264,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        images, img_masks = self.prepare_images(batch)
+        current_phase = kwargs.get("current_phase")
+        images, img_masks = self.prepare_images(batch, current_phase=current_phase)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            task_descriptions=batch.get("task"),
+            **kwargs,
         )
         if self._skill_linking_enabled():
             actions, transition_logits = actions
             self._pending_skill = transition_logits.argmax(dim=-1)
             self._last_transition_prediction = self._pending_skill.clone()
+        elif self._phase_masking_enabled():
+            actions, phase_logits = actions
+            self._pending_phase = phase_logits.argmax(dim=-1)
+            self._last_phase_prediction = self._pending_phase.clone()
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -252,8 +308,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def predict_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
-        if self._skill_linking_enabled():
-            raise RuntimeError("Skill linking supports synchronous select_action only.")
+        if self._skill_linking_enabled() or self._phase_masking_enabled() or self._atomic_planner_enabled():
+            raise RuntimeError(
+                "Stateful skill/phase/planner prediction supports synchronous select_action only."
+            )
         self.eval()
 
         batch = self._prepare_batch(batch)
@@ -282,13 +340,31 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
+            atomic_skill_id = kwargs.get("atomic_skill_id")
+            if self._atomic_planner_enabled():
+                if atomic_skill_id is not None:
+                    raise ValueError(
+                        "Do not manually pass `atomic_skill_id` while the frozen atomic planner is enabled."
+                    )
+                atomic_skill_id = self.replan_atomic_skill(batch)
             current_skill = None
+            current_phase = None
             if self._skill_linking_enabled():
                 self._ensure_skill_state(batch[OBS_STATE].shape[0], batch[OBS_STATE].device)
                 self._apply_pending_skill()
                 current_skill = self._current_skill
+            elif self._phase_masking_enabled():
+                self._ensure_phase_state(batch[OBS_STATE].shape[0], batch[OBS_STATE].device)
+                self._apply_pending_phase()
+                current_phase = self._current_phase
 
-            actions = self._get_action_chunk(batch, noise, current_skill=current_skill)
+            actions = self._get_action_chunk(
+                batch,
+                noise,
+                current_skill=current_skill,
+                current_phase=current_phase,
+                atomic_skill_id=atomic_skill_id,
+            )
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -304,6 +380,134 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _skill_linking_enabled(self) -> bool:
         return getattr(self.config, "skill_linking_enabled", False)
+
+    def _phase_masking_enabled(self) -> bool:
+        return getattr(self.config, "phase_camera_masking_enabled", False)
+
+    def _atomic_planner_enabled(self) -> bool:
+        return getattr(self.config, "atomic_planner_enabled", False)
+
+    def _atomic_planner_prompt(self, task: str) -> str:
+        previous = "none" if self._atomic_planner_skill is None else ATOMIC_SKILLS[self._atomic_planner_skill]
+        steps = 0 if self._atomic_planner_skill is None else self.config.n_action_steps
+        return (
+            "Choose the current robot manipulation skill from pick, place, push, turn, open, close. "
+            f"Task: {task}\nPrevious skill: {previous}\nActions executed since the previous decision: {steps}\n"
+            "Return exactly one JSON object and no other text: "
+            '{"decision":"continue|switch","skill":"pick|place|push|turn|open|close"}'
+        )
+
+    def replan_atomic_skill(self, batch: dict[str, Tensor]) -> Tensor:
+        """Run one Think–Act-style planning interval using the policy's own frozen VLM."""
+        batch_size = batch[OBS_STATE].shape[0]
+        if batch_size != 1:
+            raise ValueError("Frozen atomic planner evaluation requires sequential batch-size-1 rollouts.")
+        task = batch.get("task", [""])
+        task = task[0] if isinstance(task, (list, tuple)) else task
+        if not isinstance(task, str) or not task:
+            raise ValueError("Frozen atomic planner requires one non-empty task instruction.")
+
+        images = []
+        for key in self.config.image_features:
+            if key not in batch:
+                continue
+            image = batch[key]
+            image = image[:, -1] if image.ndim == 5 else image
+            images.append(image[0])
+        if len(images) != 2:
+            raise ValueError("Frozen atomic planner requires exactly the main and wrist camera images.")
+        prompt = self._atomic_planner_prompt(task)
+        started = time.perf_counter()
+        raw_output = self.model.vlm_with_expert.generate_atomic_planner_output(images, prompt)
+        previous = None if self._atomic_planner_skill is None else ATOMIC_SKILLS[self._atomic_planner_skill]
+        try:
+            decision, skill_id = parse_atomic_planner_output(raw_output, previous)
+        except ValueError as error:
+            self._atomic_planner_consecutive_failures += 1
+            self.atomic_planner_history.append(
+                {
+                    "prompt": prompt,
+                    "raw_output": raw_output,
+                    "parse_failure": True,
+                    "latency_s": time.perf_counter() - started,
+                }
+            )
+            if self._atomic_planner_skill is None or self._atomic_planner_consecutive_failures >= 2:
+                raise AtomicPlannerEpisodeFailure(str(error)) from error
+            return torch.tensor(
+                [self._atomic_planner_skill], dtype=torch.long, device=batch[OBS_STATE].device
+            )
+
+        self._atomic_planner_consecutive_failures = 0
+        if decision == "switch":
+            self._queues[ACTION].clear()
+        self._atomic_planner_skill = skill_id
+        self.atomic_planner_history.append(
+            {
+                "prompt": prompt,
+                "raw_output": raw_output,
+                "decision": decision,
+                "skill": ATOMIC_SKILLS[skill_id],
+                "parse_failure": False,
+                "latency_s": time.perf_counter() - started,
+            }
+        )
+        return torch.tensor([skill_id], dtype=torch.long, device=batch[OBS_STATE].device)
+
+    def _atomic_batch_contract(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        labels = batch.get("subtask_index")
+        labels_is_pad = batch.get("subtask_index_is_pad")
+        if labels is None or labels_is_pad is None:
+            raise KeyError("Atomic data handling requires `subtask_index` and `subtask_index_is_pad`.")
+        if labels.ndim != 2 or labels.shape != labels_is_pad.shape:
+            raise ValueError("Atomic subtask labels and padding mask must be aligned rank-2 tensors.")
+        if labels.shape[1] != self.config.chunk_size or labels_is_pad[:, 0].any():
+            raise ValueError("Atomic subtask windows must cover the chunk and have an unpadded anchor.")
+
+        mapping = torch.tensor(self.config.atomic_subtask_to_skill, device=labels.device)
+        valid = ~labels_is_pad.bool()
+        if ((labels[valid] < 0) | (labels[valid] >= mapping.numel())).any():
+            raise ValueError("Atomic subtask index is outside the frozen mapping vocabulary.")
+        safe_labels = labels.long().clamp(0, mapping.numel() - 1)
+        skills = mapping[safe_labels]
+        current_skill = skills[:, 0]
+        boundary_is_pad = labels_is_pad.bool() | (skills != current_skill[:, None])
+        return current_skill, boundary_is_pad
+
+    def _ensure_phase_state(self, batch_size: int, device: torch.device) -> None:
+        if torch.is_tensor(self._current_phase):
+            if self._current_phase.shape == (batch_size,) and self._current_phase.device == device:
+                return
+        self._current_phase = torch.zeros(batch_size, dtype=torch.long, device=device)
+        self._pending_phase = None
+
+    def _apply_pending_phase(self) -> None:
+        if self._pending_phase is None:
+            return
+        self._current_phase = self._pending_phase
+        self._pending_phase = None
+
+    def _build_phase_targets(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        phase_index = batch.get("phase_index")
+        phase_is_pad = batch.get("phase_index_is_pad")
+        if phase_index is None or phase_is_pad is None:
+            raise KeyError(
+                "Phase-aware masking requires per-frame `phase_index` labels; "
+                "semantic `subtask_index` alone cannot define MOVE/INTERACT boundaries."
+            )
+        if phase_index.ndim != 2 or phase_is_pad.ndim != 2 or phase_index.shape != phase_is_pad.shape:
+            raise ValueError("`phase_index` and `phase_index_is_pad` must be aligned rank-2 tensors.")
+        if phase_index.shape[1] != 2:
+            raise ValueError("Phase-aware masking requires phase labels at offsets [0, n_action_steps].")
+
+        pad = phase_is_pad.bool()
+        if pad[:, 0].any():
+            raise ValueError("Current phase cannot be padded.")
+        valid_labels = phase_index[~pad]
+        if not torch.all((valid_labels == -1) | (valid_labels == 1)):
+            raise ValueError("Long-VLA phase labels must use moving=-1 and interaction=+1.")
+        phases = (phase_index > 0).long()
+        return phases[:, 0], phases[:, 1], ~pad[:, 1]
 
     def _skill_start_index(self) -> int:
         return int(self.config.skill_linking_num_skills)
@@ -332,7 +536,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         subtask_index = batch["subtask_index"]
         subtask_index_is_pad = batch["subtask_index_is_pad"]
         if subtask_index.ndim != 2 or subtask_index_is_pad.ndim != 2:
-            raise ValueError("Skill linking requires rank-2 `subtask_index` and `subtask_index_is_pad` tensors.")
+            raise ValueError(
+                "Skill linking requires rank-2 `subtask_index` and `subtask_index_is_pad` tensors."
+            )
         if subtask_index.shape != subtask_index_is_pad.shape:
             raise ValueError("`subtask_index` and `subtask_index_is_pad` must have the same shape.")
         if subtask_index.shape[1] <= horizon:
@@ -377,21 +583,70 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     @classmethod
     def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
-        if not getattr(model.config, "skill_linking_enabled", False):
+        if getattr(model.config, "atomic_sgmoe_enabled", False):
+            from safetensors.torch import load_file
+
+            from lerobot.policies.utils import log_model_loading_keys
+
+            checkpoint = load_file(model_file, device=resolve_safetensors_device(map_location))
+            current = model.state_dict()
+            atomic_keys = {key for key in current if ".mlp.shared_expert." in key}
+            checkpoint_atomic_keys = {key for key in checkpoint if ".mlp.shared_expert." in key}
+            if checkpoint_atomic_keys and checkpoint_atomic_keys != atomic_keys:
+                raise ValueError("Partial Atomic SG-MoE checkpoint is not allowed.")
+
+            promoted_from_dense = not checkpoint_atomic_keys
+            if not checkpoint_atomic_keys:
+                promoted = dict(checkpoint)
+                for target_key in atomic_keys:
+                    source_key = target_key.replace(".mlp.shared_expert.", ".mlp.")
+                    if source_key not in checkpoint:
+                        raise ValueError(f"Dense checkpoint is missing action FFN key: {source_key}")
+                    promoted[target_key] = checkpoint[source_key]
+                    for expert_id in range(6):
+                        promoted[target_key.replace(".shared_expert.", f".skill_experts.{expert_id}.")] = (
+                            checkpoint[source_key].clone()
+                        )
+                    promoted.pop(source_key)
+                checkpoint = promoted
+
+            allowed_missing = (
+                {key for key in current if ".atomic_router." in key} if promoted_from_dense else set()
+            )
+            incompatible = model.load_state_dict(checkpoint, strict=False)
+            if set(incompatible.missing_keys) - allowed_missing:
+                raise ValueError(f"Missing non-router keys in Atomic checkpoint: {incompatible.missing_keys}")
+            if incompatible.unexpected_keys:
+                raise ValueError(f"Unexpected Atomic checkpoint keys: {incompatible.unexpected_keys}")
+            log_model_loading_keys(incompatible.missing_keys, incompatible.unexpected_keys)
+            return model
+
+        skill_linking_enabled = getattr(model.config, "skill_linking_enabled", False)
+        phase_masking_enabled = getattr(model.config, "phase_camera_masking_enabled", False)
+        if not skill_linking_enabled and not phase_masking_enabled:
             return super()._load_as_safetensor(model, model_file, map_location, strict)
         if strict:
             return super()._load_as_safetensor(model, model_file, map_location, strict)
 
         from lerobot.policies.utils import log_model_loading_keys
 
-        allowed_missing_prefixes = ("model.skill_embedding.", "model.transition_head.")
+        if skill_linking_enabled:
+            allowed_missing_prefixes = ("model.skill_embedding.", "model.transition_head.")
+            feature_name = "skill-linking"
+        else:
+            allowed_missing_prefixes = ("model.phase_embedding.", "model.phase_head.")
+            feature_name = "phase-masking"
         current = model.state_dict()
         checkpoint_keys = _list_safetensor_keys(model_file, map_location)
-        skill_keys = [key for key in current if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)]
-        present_skill_keys = [key for key in skill_keys if key in checkpoint_keys]
-        if present_skill_keys and len(present_skill_keys) != len(skill_keys):
-            missing_skill_keys = [key for key in skill_keys if key not in checkpoint_keys]
-            raise ValueError(f"Partial skill-linking checkpoint is not allowed: missing {missing_skill_keys}")
+        feature_keys = [
+            key for key in current if any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        present_feature_keys = [key for key in feature_keys if key in checkpoint_keys]
+        if present_feature_keys and len(present_feature_keys) != len(feature_keys):
+            missing_feature_keys = [key for key in feature_keys if key not in checkpoint_keys]
+            raise ValueError(
+                f"Partial {feature_name} checkpoint is not allowed: missing {missing_feature_keys}"
+            )
         unexpected = sorted(set(checkpoint_keys) - set(current))
         if unexpected:
             raise ValueError(f"Unexpected keys in checkpoint: {unexpected}")
@@ -399,8 +654,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         missing_keys, unexpected_keys = _load_safetensor_model(model, model_file, map_location, strict=False)
         if unexpected_keys:
             raise ValueError(f"Unexpected keys after load: {unexpected_keys}")
-        if any(not any(key.startswith(prefix) for prefix in allowed_missing_prefixes) for key in missing_keys):
-            raise ValueError(f"Missing non-skill-linking keys after load: {missing_keys}")
+        if any(
+            not any(key.startswith(prefix) for prefix in allowed_missing_prefixes) for key in missing_keys
+        ):
+            raise ValueError(f"Missing non-{feature_name} keys after load: {missing_keys}")
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model
 
@@ -421,17 +678,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        images, img_masks = self.prepare_images(batch)
+        current_skill = None
+        auxiliary_target = None
+        auxiliary_valid = None
+        auxiliary_name = None
+        current_phase = None
+        if self._skill_linking_enabled():
+            current_skill, auxiliary_target = self._build_skill_transition_targets(batch)
+            auxiliary_valid = torch.ones_like(auxiliary_target, dtype=torch.bool)
+            auxiliary_name = "transition"
+        elif self._phase_masking_enabled():
+            current_phase, auxiliary_target, auxiliary_valid = self._build_phase_targets(batch)
+            auxiliary_name = "phase"
+
+        images, img_masks = self.prepare_images(batch, current_phase=current_phase)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
+        atomic_skill_id = None
+        if self.config.atomic_data_enabled:
+            atomic_skill_id, boundary_is_pad = self._atomic_batch_contract(batch)
+            actions_is_pad = (
+                boundary_is_pad if actions_is_pad is None else actions_is_pad.bool() | boundary_is_pad
+            )
         loss_dict = {}
-        current_skill = None
-        transition_target = None
-        if self._skill_linking_enabled():
-            current_skill, transition_target = self._build_skill_transition_targets(batch)
         model_output = self.model.forward(
             images,
             img_masks,
@@ -442,10 +714,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             noise,
             time,
             current_skill=current_skill,
+            current_phase=current_phase,
+            atomic_skill_id=atomic_skill_id,
         )
-        transition_logits = None
-        if self._skill_linking_enabled():
-            losses, transition_logits = model_output
+        auxiliary_logits = None
+        if auxiliary_name is not None:
+            losses, auxiliary_logits = model_output
         else:
             losses = model_output
         original_action_dim = self.config.action_feature.shape[0]
@@ -461,7 +735,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
-        if not self._skill_linking_enabled():
+        if auxiliary_name is None:
             if reduction == "none":
                 # Return per-sample losses (B,) by averaging over valid (time, action) entries
                 if actions_is_pad is None:
@@ -481,14 +755,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 loss_dict["loss"] = loss.item()
                 return loss, loss_dict
 
-        class_weights = getattr(self.config, "skill_transition_class_weights", None)
-        transition_weight = (
+        class_weights = (
+            getattr(self.config, "skill_transition_class_weights", None)
+            if self._skill_linking_enabled()
+            else None
+        )
+        auxiliary_weight = (
             None
             if class_weights is None
-            else torch.tensor(class_weights, dtype=torch.float32, device=transition_logits.device)
+            else torch.tensor(class_weights, dtype=torch.float32, device=auxiliary_logits.device)
         )
-        transition_lambda = self.config.skill_transition_loss_weight
-        loss_dict["transition_logits_mean"] = transition_logits.float().mean().item()
+        auxiliary_lambda = (
+            self.config.skill_transition_loss_weight
+            if self._skill_linking_enabled()
+            else self.config.phase_loss_weight
+        )
+        loss_dict[f"{auxiliary_name}_logits_mean"] = auxiliary_logits.float().mean().item()
+        auxiliary_losses = F.cross_entropy(
+            auxiliary_logits.float(),
+            auxiliary_target,
+            weight=auxiliary_weight,
+            reduction="none",
+        )
+        auxiliary_losses = auxiliary_losses * auxiliary_valid.to(dtype=auxiliary_losses.dtype)
 
         if reduction == "none":
             if actions_is_pad is None:
@@ -496,15 +785,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 flow_loss = losses.sum(dim=(1, 2)) / num_valid
-            transition_loss = F.cross_entropy(
-                transition_logits.float(),
-                transition_target,
-                weight=transition_weight,
-                reduction="none",
-            )
-            per_sample_loss = flow_loss + transition_lambda * transition_loss
+            per_sample_loss = flow_loss + auxiliary_lambda * auxiliary_losses
             loss_dict["flow_loss"] = flow_loss.mean().item()
-            loss_dict["transition_loss"] = transition_loss.mean().item()
+            loss_dict[f"{auxiliary_name}_loss"] = (
+                auxiliary_losses.sum() / auxiliary_valid.sum().clamp_min(1)
+            ).item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
 
@@ -513,19 +798,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         else:
             num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
             flow_loss = losses.sum() / num_valid
-        transition_loss = F.cross_entropy(
-            transition_logits.float(),
-            transition_target,
-            weight=transition_weight,
-            reduction="mean",
-        )
-        loss = flow_loss + transition_lambda * transition_loss
+        auxiliary_loss = auxiliary_losses.sum() / auxiliary_valid.sum().clamp_min(1)
+        loss = flow_loss + auxiliary_lambda * auxiliary_loss
         loss_dict["flow_loss"] = flow_loss.item()
-        loss_dict["transition_loss"] = transition_loss.item()
+        loss_dict[f"{auxiliary_name}_loss"] = auxiliary_loss.item()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
-    def prepare_images(self, batch):
+    def prepare_images(self, batch, current_phase: Tensor | None = None):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
@@ -559,6 +839,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = batch[f"{key}_padding_mask"].bool()
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            if self._phase_masking_enabled():
+                if current_phase is None:
+                    raise ValueError("Phase-aware masking requires current_phase.")
+                phase = current_phase.to(device=device).bool()
+                if key == self.config.phase_static_camera_key:
+                    mask = mask & ~phase
+                elif key == self.config.phase_wrist_camera_key:
+                    mask = mask & phase
             images.append(img)
             img_masks.append(mask)
 
@@ -702,6 +990,11 @@ class VLAFlowMatching(nn.Module):
             focus_token_diagnostics_path=self.config.focus_token_diagnostics_path,
             focus_cascaded_attention=self.config.focus_cascaded_attention,
             focus_channel_gate=self.config.focus_channel_gate,
+            attention_map=self.config.attention_map,
+            attention_map_output_dir=self.config.attention_map_output_dir,
+            attention_map_layers=self.config.attention_map_layers,
+            attention_map_flow_steps=self.config.attention_map_flow_steps,
+            atomic_sgmoe_enabled=self.config.atomic_sgmoe_enabled,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(
@@ -718,6 +1011,8 @@ class VLAFlowMatching(nn.Module):
         )
         self.skill_embedding = None
         self.transition_head = None
+        self.phase_embedding = None
+        self.phase_head = None
         if self._skill_linking_enabled():
             self.skill_embedding = nn.Embedding(
                 self.config.skill_linking_num_skills + 1, self.vlm_with_expert.expert_hidden_size
@@ -726,6 +1021,10 @@ class VLAFlowMatching(nn.Module):
             self.transition_head = nn.Linear(
                 self.vlm_with_expert.expert_hidden_size, self.config.skill_linking_num_skills + 2
             )
+        elif self._phase_masking_enabled():
+            self.phase_embedding = nn.Embedding(2, self.vlm_with_expert.expert_hidden_size)
+            nn.init.zeros_(self.phase_embedding.weight)
+            self.phase_head = nn.Linear(self.vlm_with_expert.expert_hidden_size, 2)
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -750,6 +1049,9 @@ class VLAFlowMatching(nn.Module):
 
     def _skill_linking_enabled(self) -> bool:
         return getattr(self.config, "skill_linking_enabled", False)
+
+    def _phase_masking_enabled(self) -> bool:
+        return getattr(self.config, "phase_camera_masking_enabled", False)
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -858,7 +1160,13 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks, tuple(visual_token_spans)
 
-    def embed_suffix(self, noisy_actions, timestep, current_skill: Tensor | None = None):
+    def embed_suffix(
+        self,
+        noisy_actions,
+        timestep,
+        current_skill: Tensor | None = None,
+        current_phase: Tensor | None = None,
+    ):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -889,7 +1197,16 @@ class VLAFlowMatching(nn.Module):
             if current_skill is None:
                 raise ValueError("Skill linking requires current_skill for suffix embedding.")
             skill_emb = self.skill_embedding(current_skill.long().to(device=device))[:, None, :]
-            action_time_emb = action_time_emb + skill_emb.to(dtype=action_time_emb.dtype).expand_as(action_time_emb)
+            action_time_emb = action_time_emb + skill_emb.to(dtype=action_time_emb.dtype).expand_as(
+                action_time_emb
+            )
+        elif self._phase_masking_enabled():
+            if current_phase is None:
+                raise ValueError("Phase-aware masking requires current_phase for suffix embedding.")
+            phase_emb = self.phase_embedding(current_phase.long().to(device=device))[:, None, :]
+            action_time_emb = action_time_emb + phase_emb.to(dtype=action_time_emb.dtype).expand_as(
+                action_time_emb
+            )
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -912,8 +1229,24 @@ class VLAFlowMatching(nn.Module):
         pooled = pooled.to(dtype=self.transition_head.weight.dtype)
         return self.transition_head(pooled).float()
 
+    def _phase_logits_from_suffix(self, suffix_out: Tensor) -> Tensor:
+        horizon = min(self.config.n_action_steps, suffix_out.shape[1])
+        pooled = suffix_out[:, :horizon].to(dtype=self.phase_head.weight.dtype).mean(dim=1)
+        return self.phase_head(pooled).float()
+
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, current_skill=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        current_skill=None,
+        current_phase=None,
+        atomic_skill_id=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -928,7 +1261,9 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks, visual_token_spans = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, current_skill=current_skill)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, time, current_skill=current_skill, current_phase=current_phase
+        )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -942,15 +1277,18 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             visual_token_spans=visual_token_spans,
+            atomic_skill_id=atomic_skill_id,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        if not self._skill_linking_enabled():
-            return losses
-        return losses, self._transition_logits_from_suffix(suffix_out)
+        if self._skill_linking_enabled():
+            return losses, self._transition_logits_from_suffix(suffix_out)
+        if self._phase_masking_enabled():
+            return losses, self._phase_logits_from_suffix(suffix_out)
+        return losses
 
     def sample_actions(
         self,
@@ -961,6 +1299,9 @@ class VLAFlowMatching(nn.Module):
         state,
         noise=None,
         current_skill: Tensor | None = None,
+        current_phase: Tensor | None = None,
+        atomic_skill_id: Tensor | None = None,
+        task_descriptions: list[str] | tuple[str, ...] | str | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -985,11 +1326,13 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
         )
         num_steps = self.config.num_steps
-        latest_transition_logits = None
+        latest_auxiliary_logits = None
         self.vlm_with_expert.start_focus_token_diagnostics_call(images)
+        self.vlm_with_expert.start_attention_map_call(images, visual_token_spans, task_descriptions)
         try:
-            def denoise_with_transition(input_x_t, current_timestep):
-                nonlocal latest_transition_logits
+
+            def denoise_with_auxiliary(input_x_t, current_timestep):
+                nonlocal latest_auxiliary_logits
                 denoise_out = self.denoise_step(
                     x_t=input_x_t,
                     prefix_pad_masks=prefix_pad_masks,
@@ -997,14 +1340,16 @@ class VLAFlowMatching(nn.Module):
                     timestep=current_timestep,
                     visual_token_spans=visual_token_spans,
                     current_skill=current_skill,
+                    current_phase=current_phase,
+                    atomic_skill_id=atomic_skill_id,
                 )
-                if self._skill_linking_enabled():
-                    velocity, latest_transition_logits = denoise_out
+                if self._skill_linking_enabled() or self._phase_masking_enabled():
+                    velocity, latest_auxiliary_logits = denoise_out
                     return velocity
                 return denoise_out
 
             actions = euler_integrate(
-                denoise_with_transition,
+                denoise_with_auxiliary,
                 noise,
                 num_steps,
                 rtc_processor=self.rtc_processor,
@@ -1013,12 +1358,13 @@ class VLAFlowMatching(nn.Module):
                 prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
                 execution_horizon=kwargs.get("execution_horizon"),
             )
-            if not self._skill_linking_enabled():
+            if not self._skill_linking_enabled() and not self._phase_masking_enabled():
                 return actions
-            if latest_transition_logits is None:
-                raise RuntimeError("Skill linking expected transition logits from the final denoise step.")
-            return actions, latest_transition_logits
+            if latest_auxiliary_logits is None:
+                raise RuntimeError("Expected auxiliary logits from the final denoise step.")
+            return actions, latest_auxiliary_logits
         finally:
+            self.vlm_with_expert.end_attention_map_call()
             self.vlm_with_expert.end_focus_token_diagnostics_call()
 
     def denoise_step(
@@ -1029,16 +1375,24 @@ class VLAFlowMatching(nn.Module):
         timestep,
         visual_token_spans,
         current_skill: Tensor | None = None,
+        current_phase: Tensor | None = None,
+        atomic_skill_id: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        if self.vlm_with_expert.focus_token_diagnostics_path is not None:
+        if (
+            self.vlm_with_expert.focus_token_diagnostics_path is not None
+            or getattr(self.vlm_with_expert, "attention_map_collector", None) is not None
+        ):
             timestep_value = float(timestep[0].item())
-            self.vlm_with_expert.focus_token_diagnostics_context.update(
-                denoising_step=round((1.0 - timestep_value) * self.config.num_steps),
-                denoising_timestep=timestep_value,
-            )
+            denoising_step = round((1.0 - timestep_value) * self.config.num_steps)
+            if self.vlm_with_expert.focus_token_diagnostics_path is not None:
+                self.vlm_with_expert.focus_token_diagnostics_context.update(
+                    denoising_step=denoising_step,
+                    denoising_timestep=timestep_value,
+                )
+            self.vlm_with_expert.set_attention_map_flow_step(denoising_step)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            x_t, timestep, current_skill=current_skill
+            x_t, timestep, current_skill=current_skill, current_phase=current_phase
         )
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1059,6 +1413,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             visual_token_spans=visual_token_spans,
+            atomic_skill_id=atomic_skill_id,
         )
         if past_key_values is not None:
             # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
@@ -1067,6 +1422,8 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        if not self._skill_linking_enabled():
-            return v_t
-        return v_t, self._transition_logits_from_suffix(suffix_out)
+        if self._skill_linking_enabled():
+            return v_t, self._transition_logits_from_suffix(suffix_out)
+        if self._phase_masking_enabled():
+            return v_t, self._phase_logits_from_suffix(suffix_out)
+        return v_t

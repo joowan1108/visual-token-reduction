@@ -85,6 +85,7 @@ from lerobot.envs import (
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.pretrained import RolloutEpisodeFailure
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
@@ -215,6 +216,8 @@ def rollout(
         The dictionary described above.
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
+    if getattr(getattr(policy, "config", None), "atomic_planner_enabled", False) and env.num_envs != 1:
+        raise ValueError("Frozen atomic planner evaluation requires batch_size=1.")
 
     # Reset the policy and environments.
     policy.reset()
@@ -256,6 +259,7 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    all_policy_failures = []
 
     step = 0
     # Keep track of which environments are done.
@@ -289,8 +293,23 @@ def rollout(
             observation = env_preprocessor(observation)
 
             observation = preprocessor(observation)
-            with torch.inference_mode():
-                action = policy.select_action(observation)
+            try:
+                with torch.inference_mode():
+                    action = policy.select_action(observation)
+            except RolloutEpisodeFailure as error:
+                if env.num_envs != 1:
+                    raise RuntimeError(
+                        "Atomic planner failures require sequential batch-size-1 evaluation."
+                    ) from error
+                logger.warning("Atomic planner terminated the episode: %s", error)
+                action_dim = policy.config.action_feature.shape[0]
+                all_actions.append(torch.zeros(1, action_dim))
+                all_rewards.append(torch.zeros(1))
+                all_dones.append(torch.ones(1, dtype=torch.bool))
+                all_successes.append(torch.zeros(1, dtype=torch.bool))
+                all_policy_failures.append(torch.ones(1, dtype=torch.bool))
+                step += 1
+                break
             if predicted_latents_callback is not None:
                 predicted_latents_callback(policy)
             action = postprocessor(action)
@@ -370,6 +389,7 @@ def rollout(
             all_rewards.append(torch.from_numpy(reward))
             all_dones.append(torch.from_numpy(done))
             all_successes.append(torch.tensor(successes))
+            all_policy_failures.append(torch.zeros(env.num_envs, dtype=torch.bool))
 
             step += 1
             running_success_rate = (
@@ -389,8 +409,11 @@ def rollout(
 
     # Track the final observation.
     if return_observations:
-        observation = preprocess_observation(observation)
-        all_observations.append(deepcopy(observation))
+        if all_policy_failures and all_policy_failures[-1].any():
+            all_observations.append(deepcopy(all_observations[-1]))
+        else:
+            observation = preprocess_observation(observation)
+            all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
     ret = {
@@ -398,6 +421,7 @@ def rollout(
         "reward": torch.stack(all_rewards, dim=1),
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
+        "policy_failure": torch.stack(all_policy_failures, dim=1),
     }
     if return_observations:
         stacked_observations = {}
@@ -475,6 +499,8 @@ def eval_policy(
     sum_rewards = []
     max_rewards = []
     all_successes = []
+    all_policy_failures = []
+    all_planner_histories = []
     all_seeds = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
@@ -564,6 +590,10 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        batch_policy_failures = einops.reduce(rollout_data["policy_failure"], "b n -> b", "any")
+        all_policy_failures.extend(batch_policy_failures.tolist())
+        planner_history = deepcopy(getattr(policy, "atomic_planner_history", []))
+        all_planner_histories.extend([planner_history] * env.num_envs)
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -656,13 +686,17 @@ def eval_policy(
                 "sum_reward": sum_reward,
                 "max_reward": max_reward,
                 "success": success,
+                "policy_failure": policy_failure,
+                "atomic_planner_history": planner_history,
                 "seed": seed,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, policy_failure, planner_history, seed) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
+                    all_policy_failures[:n_episodes],
+                    all_planner_histories[:n_episodes],
                     all_seeds[:n_episodes],
                     strict=True,
                 )

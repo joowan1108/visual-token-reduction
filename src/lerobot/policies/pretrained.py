@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound="PreTrainedPolicy")
 
 
+class RolloutEpisodeFailure(RuntimeError):
+    """A policy-requested unsuccessful termination of the current rollout."""
+
+
 def _build_card_context(
     cfg: TrainPipelineConfig | None,
     dataset_meta: LeRobotDatasetMetadata | None,

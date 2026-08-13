@@ -19,17 +19,20 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
+import pyarrow.parquet as pq
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
@@ -52,7 +55,12 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_train_eval_datasets
-from lerobot.datasets.sampler import EpisodeAwareSampler, SkillLinkingSampler, compute_sampler_state
+from lerobot.datasets.sampler import (
+    AtomicSkillSampler,
+    EpisodeAwareSampler,
+    SkillLinkingSampler,
+    compute_sampler_state,
+)
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -74,6 +82,39 @@ if TYPE_CHECKING or _peft_available:
     from peft import PeftModel
 else:
     PeftModel = None
+
+
+def _resolve_atomic_subtask_mapping(dataset, policy_config) -> list[int]:
+    mapping_path = policy_config.atomic_subtask_to_skill_path
+    if mapping_path is None:
+        mapping = policy_config.atomic_subtask_to_skill
+        observed = set(dataset.hf_dataset.data.column("subtask_index").to_numpy().tolist())
+        if observed != set(range(len(mapping))):
+            raise ValueError("Observed subtask IDs do not exactly cover the frozen atomic mapping.")
+        return mapping
+
+    with Path(mapping_path).open(encoding="utf-8") as mapping_file:
+        named_mapping = json.load(mapping_file)
+    if not isinstance(named_mapping, dict) or len(named_mapping) != 52:
+        raise ValueError("Atomic mapping must be a JSON object containing all 52 SARM subtasks.")
+
+    subtask_table = pq.read_table(dataset.root / "meta/subtasks.parquet").to_pydict()
+    names = subtask_table["__index_level_0__"]
+    indices = subtask_table["subtask_index"]
+    ordered_names = [name for _, name in sorted(zip(indices, names, strict=True))]
+    if ordered_names != list(named_mapping):
+        raise ValueError("Atomic mapping names/order do not exactly match SARM `meta/subtasks.parquet`.")
+    skill_ids = {"pick": 0, "place": 1, "push": 2, "turn": 3, "open": 4, "close": 5}
+    try:
+        mapping = [skill_ids[named_mapping[name]] for name in ordered_names]
+    except KeyError as error:
+        raise ValueError(f"Unknown atomic skill in mapping: {error.args[0]}") from error
+    observed = set(dataset.hf_dataset.data.column("subtask_index").to_numpy().tolist())
+    if observed != set(range(len(mapping))):
+        raise ValueError("Observed subtask IDs do not exactly cover the frozen atomic mapping.")
+    policy_config.atomic_subtask_to_skill = mapping
+    return mapping
+
 
 from .lerobot_eval import eval_policy_all
 
@@ -306,6 +347,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     active_cfg = cfg.trainable_config
     skill_linking_sampler = None
+    atomic_sampler = None
     use_skill_linking_sampler = not cfg.is_reward_model_training and (
         getattr(active_cfg, "skill_linking_enabled", False)
         or getattr(active_cfg, "skill_linking_sampler_enabled", False)
@@ -323,7 +365,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
-        if getattr(active_cfg, "skill_linking_enabled", False) and active_cfg.skill_transition_class_weights is None:
+        if (
+            getattr(active_cfg, "skill_linking_enabled", False)
+            and active_cfg.skill_transition_class_weights is None
+        ):
             if cfg.dataset.episodes is not None:
                 raise ValueError(
                     "Subset skill-linking runs require class weights frozen from the full train split."
@@ -332,7 +377,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 active_cfg.skill_linking_num_skills
             )
             if is_main_process:
-                logging.info(f"Deterministic skill transition class weights: {active_cfg.skill_transition_class_weights}")
+                logging.info(
+                    f"Deterministic skill transition class weights: {active_cfg.skill_transition_class_weights}"
+                )
+    if not cfg.is_reward_model_training and getattr(active_cfg, "atomic_data_enabled", False):
+        if cfg.dataset.streaming:
+            raise ValueError("Atomic skill sampling requires a non-streaming dataset.")
+        atomic_mapping = _resolve_atomic_subtask_mapping(dataset, active_cfg)
+        atomic_sampler = AtomicSkillSampler(
+            dataset.meta.episodes["dataset_from_index"],
+            dataset.meta.episodes["dataset_to_index"],
+            subtask_indices=dataset.hf_dataset.data.column("subtask_index").to_numpy(),
+            subtask_to_skill=atomic_mapping,
+            episode_indices_to_use=dataset.episodes,
+            seed=cfg.seed if cfg.seed is not None else 0,
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+        )
 
     if cfg.is_reward_model_training:
         if is_main_process:
@@ -483,7 +543,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
         # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
         shuffle = False
-        if use_skill_linking_sampler:
+        if atomic_sampler is not None:
+            sampler = atomic_sampler
+        elif use_skill_linking_sampler:
             sampler = skill_linking_sampler
         else:
             sampler = EpisodeAwareSampler(

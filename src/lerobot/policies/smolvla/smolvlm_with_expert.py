@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from lerobot.policies.smolvla.attention_analysis import AttentionMapCollector
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
@@ -83,7 +84,7 @@ def _select_visual_tokens(
     keep_ratio: float,
     diagnostics: list[dict] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select visual K/V per camera and sample while retaining every non-visual position."""
+    """Select visual K/V globally per sample while retaining every non-visual position."""
     batch_size, prefix_len, num_key_value_heads, head_dim = key_states.shape
     num_query_heads = query_states.shape[2]
     key_for_scores = key_states.repeat_interleave(num_query_heads // num_key_value_heads, dim=2)
@@ -91,45 +92,40 @@ def _select_visual_tokens(
         query_states.shape[1] * num_query_heads * math.sqrt(head_dim)
     )
 
+    visual_positions = torch.cat(
+        [torch.arange(start, end, device=key_states.device) for start, end in visual_token_spans]
+    )
     keep = torch.ones(batch_size, prefix_len, dtype=torch.bool, device=key_states.device)
-    for camera_idx, (start, end) in enumerate(visual_token_spans):
-        keep[:, start:end] = False
-        valid = attention_mask[:, :, start:end].any(dim=1)
-        for batch_idx in range(batch_size):
-            valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
-            if valid_indices.numel() == 0:
-                if diagnostics is not None:
-                    diagnostics.append(
-                        {
-                            "batch_index": batch_idx,
-                            "camera": camera_idx,
-                            "valid_token_count": 0,
-                            "selected_token_count": 0,
-                            "selected_indices": [],
-                            "selected_prefix_indices": [],
-                            "attention_distribution": [0.0] * (end - start),
-                            "topk_attention_mass": 0.0,
-                        }
-                    )
-                continue
-            count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
-            camera_scores = scores[batch_idx, start:end][valid_indices]
-            selected = valid_indices[torch.topk(camera_scores, count, sorted=False).indices] + start
-            keep[batch_idx, selected] = True
-            if diagnostics is not None:
-                selected = selected.sort().values
-                attention_distribution = torch.zeros(end - start, device=camera_scores.device)
-                attention_distribution[valid_indices] = camera_scores.softmax(dim=0)
+    keep[:, visual_positions] = False
+    valid = attention_mask.index_select(2, visual_positions).any(dim=1)
+    selector_distribution = torch.zeros(batch_size, visual_positions.numel(), device=key_states.device)
+    for batch_idx in range(batch_size):
+        valid_indices = torch.nonzero(valid[batch_idx], as_tuple=False).squeeze(1)
+        if valid_indices.numel() == 0:
+            continue
+        count = max(1, math.ceil(keep_ratio * valid_indices.numel()))
+        visual_scores = scores[batch_idx, visual_positions][valid_indices]
+        selected_visual = valid_indices[torch.topk(visual_scores, count, sorted=False).indices]
+        keep[batch_idx, visual_positions[selected_visual]] = True
+        selector_distribution[batch_idx, valid_indices] = visual_scores.softmax(dim=0)
+
+    if diagnostics is not None:
+        for camera_idx, (start, end) in enumerate(visual_token_spans):
+            camera_positions = (visual_positions >= start) & (visual_positions < end)
+            for batch_idx in range(batch_size):
+                camera_valid = valid[batch_idx, camera_positions]
+                selected = torch.nonzero(keep[batch_idx, start:end], as_tuple=False).squeeze(1)
+                distribution = selector_distribution[batch_idx, camera_positions]
                 diagnostics.append(
                     {
                         "batch_index": batch_idx,
                         "camera": camera_idx,
-                        "valid_token_count": int(valid_indices.numel()),
-                        "selected_token_count": count,
-                        "selected_indices": (selected - start).tolist(),
-                        "selected_prefix_indices": selected.tolist(),
-                        "attention_distribution": attention_distribution.tolist(),
-                        "topk_attention_mass": float(attention_distribution[selected - start].sum().item()),
+                        "valid_token_count": int(camera_valid.sum().item()),
+                        "selected_token_count": int(selected.numel()),
+                        "selected_indices": selected.tolist(),
+                        "selected_prefix_indices": (selected + start).tolist(),
+                        "attention_distribution": distribution.tolist(),
+                        "topk_attention_mass": float(distribution[selected].sum().item()),
                     }
                 )
 
@@ -211,12 +207,65 @@ def _cascaded_diagnostics(
                     "selected_indices": selected_local.tolist(),
                     "selected_prefix_indices": visual_positions[camera_tokens][selected_local].tolist(),
                     "attention_distribution": camera_selected.float().mean(dim=0).tolist(),
-                    "topk_attention_mass": float(
-                        (camera_probs * camera_selected).sum(dim=1).mean().item()
-                    ),
+                    "topk_attention_mass": float((camera_probs * camera_selected).sum(dim=1).mean().item()),
                 }
             )
     return records
+
+
+class AtomicSkillRouter(nn.Module):
+    """The single six-skill router used by every action-expert layer."""
+
+    num_skills = 6
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        if hidden_size < self.num_skills:
+            raise ValueError("Action-expert hidden size must fit all atomic skill embeddings.")
+        scales = torch.linspace(10.0, 100.0, self.num_skills)
+        embeddings = torch.zeros(self.num_skills, hidden_size)
+        embeddings[:, : self.num_skills] = torch.diag(scales)
+        self.register_buffer("skill_embeddings", embeddings)
+        self.route = nn.Linear(hidden_size, self.num_skills, bias=False)
+        with torch.no_grad():
+            self.route.weight.zero_()
+            self.route.weight[:, : self.num_skills].copy_(
+                torch.eye(self.num_skills) * (math.log(self.num_skills - 1) / 55.0)
+            )
+
+    def forward(self, skill_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        skill_id = skill_id.long()
+        if skill_id.ndim != 1 or ((skill_id < 0) | (skill_id >= self.num_skills)).any():
+            raise ValueError("`atomic_skill_id` must be a rank-1 tensor with values in [0, 5].")
+        probabilities = self.route(self.skill_embeddings[skill_id]).softmax(dim=-1)
+        selected = probabilities.argmax(dim=-1)
+        weight = probabilities.gather(1, selected[:, None]).squeeze(1)
+        return selected, weight
+
+
+class AtomicSkillFFN(nn.Module):
+    """A dense-copy shared FFN plus six top-1 atomic skill FFNs."""
+
+    def __init__(self, dense_ffn: nn.Module):
+        super().__init__()
+        self.shared_expert = copy.deepcopy(dense_ffn)
+        self.skill_experts = nn.ModuleList(copy.deepcopy(dense_ffn) for _ in range(6))
+
+    def forward(self, x: torch.Tensor, route: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        selected, weight = route
+        if selected.shape != (x.shape[0],) or weight.shape != selected.shape:
+            raise ValueError("Atomic route must contain one expert and gate weight per batch item.")
+        shared = self.shared_expert(x)
+        output = torch.empty_like(shared)
+        for expert_id in selected.unique().tolist():
+            batch_indices = torch.nonzero(selected == expert_id, as_tuple=False).squeeze(1)
+            expert_output = self.skill_experts[expert_id](x.index_select(0, batch_indices))
+            expert_weight = weight.index_select(0, batch_indices)[:, None, None].to(shared.dtype)
+            mixed = (1 - expert_weight) * shared.index_select(
+                0, batch_indices
+            ) + expert_weight * expert_output
+            output.index_copy_(0, batch_indices, mixed)
+        return output
 
 
 class SmolVLMWithExpertModel(nn.Module):
@@ -236,6 +285,11 @@ class SmolVLMWithExpertModel(nn.Module):
         focus_token_diagnostics_path: str | None = None,
         focus_cascaded_attention: bool = False,
         focus_channel_gate: bool = False,
+        attention_map: bool = False,
+        attention_map_output_dir: str | None = None,
+        attention_map_layers: list[int] | None = None,
+        attention_map_flow_steps: list[int] | None = None,
+        atomic_sgmoe_enabled: bool = False,
         device: str = "auto",
     ):
         super().__init__()
@@ -269,6 +323,12 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
+
+        self.atomic_sgmoe_enabled = atomic_sgmoe_enabled
+        if atomic_sgmoe_enabled:
+            self.atomic_router = AtomicSkillRouter(lm_expert_config.hidden_size)
+            for layer in self.lm_expert.layers:
+                layer.mlp = AtomicSkillFFN(layer.mlp)
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
@@ -336,6 +396,17 @@ class SmolVLMWithExpertModel(nn.Module):
         self._focus_token_attention_diagnostics = None
         if focus_token_diagnostics_path is not None:
             self.enable_focus_token_diagnostics(focus_token_diagnostics_path)
+        self.attention_map_collector = (
+            AttentionMapCollector(
+                attention_map_output_dir,
+                self.num_vlm_layers,
+                attention_map_layers or [-4, -3, -2, -1],
+                attention_map_flow_steps or [-1],
+            )
+            if attention_map
+            else None
+        )
+        self._attention_map_context = None
         self.set_requires_grad()
 
     def enable_focus_token_diagnostics(self, path, **context):
@@ -398,6 +469,18 @@ class SmolVLMWithExpertModel(nn.Module):
     def end_focus_token_diagnostics_call(self):
         self.focus_token_diagnostics_image_paths = {}
 
+    def start_attention_map_call(self, images, visual_token_spans, task_descriptions=None):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.start_call(images, visual_token_spans, task_descriptions)
+
+    def set_attention_map_flow_step(self, flow_step):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.set_flow_step(flow_step)
+
+    def end_attention_map_call(self):
+        if self.attention_map_collector is not None:
+            self.attention_map_collector.end_call()
+
     def _write_focus_token_diagnostics(self, layer_idx, records):
         with self.focus_token_diagnostics_path.open("a", encoding="utf-8") as output:
             for record in records:
@@ -417,6 +500,12 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
 
     def _capture_action_visual_attention(self, probs):
+        if (
+            getattr(self, "attention_map_collector", None) is not None
+            and getattr(self, "_attention_map_context", None) is not None
+        ):
+            self.attention_map_collector.collect(probs, **self._attention_map_context)
+
         capture = getattr(self, "_focus_token_attention_diagnostics", None)
         if capture is None:
             return
@@ -444,6 +533,39 @@ class SmolVLMWithExpertModel(nn.Module):
                 record["total_prefix_camera_attention_mass"] = mass
             record["action_visual_attention_distribution"] = distribution.tolist()
 
+    def _attention_with_map(
+        self,
+        attention_interface,
+        attention_mask,
+        batch_size,
+        head_dim,
+        query_states,
+        key_states,
+        value_states,
+        *,
+        layer,
+        attention_kind,
+        original_indices,
+        scope,
+    ):
+        if getattr(self, "attention_map_collector", None) is None or not self.attention_map_collector.active:
+            return attention_interface(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+        previous = self._attention_map_context
+        self._attention_map_context = {
+            "layer": layer,
+            "attention_kind": attention_kind,
+            "original_indices": original_indices,
+            "scope": scope,
+        }
+        try:
+            return attention_interface(
+                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+        finally:
+            self._attention_map_context = previous
+
     def get_vlm_model(self):
         return self.vlm.model
 
@@ -456,6 +578,9 @@ class SmolVLMWithExpertModel(nn.Module):
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
+            if not self.freeze_vision_encoder:
+                for params in self.get_vlm_model().vision_model.parameters():
+                    params.requires_grad = True
         else:
             # To avoid unused params issue with distributed training
             last_layers = [self.num_vlm_layers - 1]
@@ -496,6 +621,8 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if self.train_expert_only:
             self.vlm.eval()
+            if not self.freeze_vision_encoder:
+                self.get_vlm_model().vision_model.train(mode)
 
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None
@@ -514,6 +641,42 @@ class SmolVLMWithExpertModel(nn.Module):
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
+
+    @torch.no_grad()
+    def generate_atomic_planner_output(
+        self, images: list[torch.Tensor], prompt: str, max_new_tokens: int = 32
+    ) -> str:
+        """Generate one deterministic response with this action policy's frozen VLM."""
+        if any(parameter.requires_grad for parameter in self.vlm.parameters()):
+            raise RuntimeError("Atomic planner requires a fully frozen VLM.")
+        if not images:
+            raise ValueError("Atomic planner requires at least one camera image.")
+
+        from PIL import Image
+
+        pil_images = []
+        for image in images:
+            if image.ndim != 3 or image.shape[0] != 3:
+                raise ValueError("Atomic planner images must have shape (3, height, width).")
+            image = image.detach().float().cpu()
+            if not torch.isfinite(image).all() or image.min() < 0 or image.max() > 1:
+                raise ValueError("Atomic planner images must contain finite values in [0, 1].")
+            pixels = (image * 255).round().to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+            pil_images.append(Image.fromarray(pixels))
+
+        content = [{"type": "image"} for _ in pil_images]
+        content.append({"type": "text", "text": prompt})
+        text = self.processor.apply_chat_template(
+            [{"role": "user", "content": content}], add_generation_prompt=True
+        )
+        inputs = self.processor(text=[text], images=[pil_images], padding=True, return_tensors="pt")
+        device = next(self.vlm.parameters()).device
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        input_length = inputs["input_ids"].shape[1]
+        generated = self.vlm.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
+        return self.processor.batch_decode(
+            generated[:, input_length:], skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
 
     def forward_attn_layer(
         self,
@@ -580,8 +743,20 @@ class SmolVLMWithExpertModel(nn.Module):
 
         attention_interface = self.get_attention_interface()
 
-        att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+        att_output = self._attention_with_map(
+            attention_interface,
+            attention_mask_,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            layer=layer_idx,
+            attention_kind="self",
+            original_indices=torch.arange(key_states.shape[1], device=key_states.device).expand(
+                batch_size, -1
+            ),
+            scope="total_sequence",
         )
         return [att_output], past_key_values
 
@@ -735,13 +910,18 @@ class SmolVLMWithExpertModel(nn.Module):
                         diagnostics,
                     )
                 try:
-                    visual_output = attention_interface(
+                    visual_output = self._attention_with_map(
+                        attention_interface,
                         visual_mask,
                         batch_size,
                         head_dim,
                         expert_query_states,
                         visual_keys,
                         visual_values,
+                        layer=layer_idx,
+                        attention_kind="cross",
+                        original_indices=visual_positions.expand(batch_size, -1),
+                        scope="visual_branch",
                     )
                     visual_output *= visual_mask.any(dim=-1, keepdim=True).to(visual_output.dtype)
                 finally:
@@ -826,13 +1006,18 @@ class SmolVLMWithExpertModel(nn.Module):
                     diagnostics,
                 )
             try:
-                att_output = attention_interface(
+                att_output = self._attention_with_map(
+                    attention_interface,
                     expert_attention_mask,
                     batch_size,
                     head_dim,
                     expert_query_states,
                     expert_key_states,
                     expert_value_states,
+                    layer=layer_idx,
+                    attention_kind="cross",
+                    original_indices=original_prefix_indices,
+                    scope="total_prefix",
                 )
             finally:
                 self._focus_token_attention_diagnostics = None
@@ -867,6 +1052,7 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         visual_token_spans: tuple[tuple[int, int], ...] | None = None,
+        atomic_skill_id: torch.Tensor | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -884,6 +1070,10 @@ class SmolVLMWithExpertModel(nn.Module):
         fill_kv_cache = use_cache and past_key_values is None
         if fill_kv_cache:
             past_key_values = DynamicCache()
+
+        atomic_route = None
+        if self.atomic_sgmoe_enabled and atomic_skill_id is not None:
+            atomic_route = self.atomic_router(atomic_skill_id)
 
         # RMSNorm
         num_layers = self.num_vlm_layers
@@ -940,7 +1130,12 @@ class SmolVLMWithExpertModel(nn.Module):
                     after_first_residual = out_emb.clone()
 
                     out_emb = layer.post_attention_layernorm(out_emb)
-                    out_emb = layer.mlp(out_emb)
+                    if i == 1 and self.atomic_sgmoe_enabled:
+                        if atomic_route is None:
+                            raise ValueError("Atomic SG-MoE requires `atomic_skill_id` for action tokens.")
+                        out_emb = layer.mlp(out_emb, atomic_route)
+                    else:
+                        out_emb = layer.mlp(out_emb)
 
                     out_emb += after_first_residual
 

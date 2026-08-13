@@ -205,6 +205,14 @@ class SkillLinkingSampler(EpisodeAwareSampler):
             valid_last = episode_end - self._action_horizon - 1
             done_idx = episode_end - self._action_horizon
             if valid_last < episode_start:
+                first_label = self._label_at(episode_start)
+                if any(
+                    self._label_at(index) != first_label for index in range(episode_start + 1, episode_end)
+                ):
+                    raise ValueError(
+                        f"Episode [{episode_start}, {episode_end}) contains a boundary but has fewer than "
+                        f"action_horizon={self._action_horizon} preceding frames."
+                    )
                 logger.warning(
                     "Episode [%d, %d) is too short for skill linking horizon=%d. Skipping.",
                     episode_start,
@@ -229,8 +237,12 @@ class SkillLinkingSampler(EpisodeAwareSampler):
                 label = self._label_at(boundary)
                 if label != prev_label:
                     candidate = boundary - self._action_horizon
-                    if episode_start <= candidate <= valid_last:
-                        self._boundary_candidates.append(candidate)
+                    if candidate < episode_start:
+                        raise ValueError(
+                            f"Boundary at frame {boundary} has fewer than action_horizon="
+                            f"{self._action_horizon} preceding frames in its episode."
+                        )
+                    self._boundary_candidates.append(candidate)
                 prev_label = label
 
         self._event_candidates = [
@@ -332,6 +344,66 @@ class SkillLinkingSampler(EpisodeAwareSampler):
 
     def __len__(self) -> int:
         return self._num_frames
+
+
+class AtomicSkillSampler(EpisodeAwareSampler):
+    """Deterministically balance six atomic skills with replacement."""
+
+    def __init__(
+        self,
+        dataset_from_indices: list[int],
+        dataset_to_indices: list[int],
+        subtask_indices: list[int] | np.ndarray,
+        subtask_to_skill: list[int],
+        episode_indices_to_use: list | None = None,
+        seed: int = 0,
+        absolute_to_relative_idx: dict[int, int] | None = None,
+    ):
+        super().__init__(
+            dataset_from_indices,
+            dataset_to_indices,
+            episode_indices_to_use=episode_indices_to_use,
+            seed=seed,
+            absolute_to_relative_idx=absolute_to_relative_idx,
+        )
+        labels = np.asarray(subtask_indices, dtype=np.int64)
+        mapping = np.asarray(subtask_to_skill, dtype=np.int64)
+        if set(mapping.tolist()) != set(range(6)):
+            raise ValueError("Atomic subtask mapping must cover exactly skill IDs 0..5.")
+        if set(labels.tolist()) != set(range(len(mapping))):
+            raise ValueError("Observed subtask IDs must exactly cover the frozen atomic mapping.")
+
+        from_indices = np.asarray(dataset_from_indices, dtype=np.int64)
+        to_indices = np.asarray(dataset_to_indices, dtype=np.int64)
+        episode_mask = np.ones(len(from_indices), dtype=bool)
+        if episode_indices_to_use is not None:
+            episode_mask[:] = False
+            episode_mask[np.asarray(episode_indices_to_use, dtype=np.int64)] = True
+
+        self._skill_candidates = [[] for _ in range(6)]
+        for start, end in zip(from_indices[episode_mask], to_indices[episode_mask], strict=True):
+            for absolute_idx in range(int(start), int(end)):
+                relative_idx = (
+                    absolute_idx
+                    if absolute_to_relative_idx is None
+                    else absolute_to_relative_idx[absolute_idx]
+                )
+                label = int(labels[relative_idx])
+                if not 0 <= label < len(mapping):
+                    raise ValueError(f"Subtask index {label} is outside the frozen atomic mapping.")
+                self._skill_candidates[int(mapping[label])].append(relative_idx)
+        if any(not candidates for candidates in self._skill_candidates):
+            raise ValueError("Every atomic skill must have at least one train anchor.")
+
+    def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
+        generator = self._epoch_generator(epoch)
+        skill_order = torch.arange(self._num_frames) % 6
+        skill_order = skill_order[torch.randperm(self._num_frames, generator=generator)]
+        for position in range(self._num_frames):
+            candidates = self._skill_candidates[int(skill_order[position])]
+            candidate = torch.randint(len(candidates), (), generator=generator).item()
+            if position >= start:
+                yield candidates[candidate]
 
 
 def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:
