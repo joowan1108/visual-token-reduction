@@ -416,6 +416,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         try:
             skill_id = parse_atomic_planner_output(raw_output)
         except ValueError as error:
+            logger.warning("Atomic planner raw output: %r", raw_output)
             self._atomic_planner_consecutive_failures += 1
             self.atomic_planner_history.append(
                 {
