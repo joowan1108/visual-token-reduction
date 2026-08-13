@@ -53,6 +53,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 """
 
 import json
+import logging
 import math
 import time
 from collections import deque
@@ -80,13 +81,14 @@ from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
 ATOMIC_SKILLS = ("pick", "place", "push", "turn", "open", "close")
+logger = logging.getLogger(__name__)
 
 
 class AtomicPlannerEpisodeFailure(RolloutEpisodeFailure):
     """The preregistered planner failure rule ended the current episode."""
 
 
-def parse_atomic_planner_output(raw_output: str, previous_skill: str | None) -> tuple[str, int]:
+def parse_atomic_planner_output(raw_output: str) -> int:
     def unique_object(pairs):
         output = dict(pairs)
         if len(output) != len(pairs):
@@ -97,21 +99,12 @@ def parse_atomic_planner_output(raw_output: str, previous_skill: str | None) -> 
         parsed = json.loads(raw_output, object_pairs_hook=unique_object)
     except (json.JSONDecodeError, TypeError) as error:
         raise ValueError("Atomic planner output must be one strict JSON object.") from error
-    if not isinstance(parsed, dict) or set(parsed) != {"decision", "skill"}:
-        raise ValueError("Atomic planner JSON must contain exactly `decision` and `skill`.")
-    decision, skill = parsed["decision"], parsed["skill"]
-    if not isinstance(decision, str) or not isinstance(skill, str):
-        raise ValueError("Atomic planner decision and skill must be strings.")
-    if decision not in {"continue", "switch"} or skill not in ATOMIC_SKILLS:
-        raise ValueError("Atomic planner decision or skill is outside the allowed enum.")
-    if previous_skill is None and decision != "switch":
-        raise ValueError("The first atomic planner decision must be `switch`.")
-    if previous_skill is not None:
-        if decision == "continue" and skill != previous_skill:
-            raise ValueError("A `continue` decision must retain the previous skill.")
-        if decision == "switch" and skill == previous_skill:
-            raise ValueError("A `switch` decision must select a different skill.")
-    return decision, ATOMIC_SKILLS.index(skill)
+    if not isinstance(parsed, dict) or set(parsed) != {"skill"}:
+        raise ValueError("Atomic planner JSON must contain exactly `skill`.")
+    skill = parsed["skill"]
+    if not isinstance(skill, str) or skill not in ATOMIC_SKILLS:
+        raise ValueError("Atomic planner skill is outside the allowed enum.")
+    return ATOMIC_SKILLS.index(skill)
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -389,12 +382,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _atomic_planner_prompt(self, task: str) -> str:
         previous = "none" if self._atomic_planner_skill is None else ATOMIC_SKILLS[self._atomic_planner_skill]
-        steps = 0 if self._atomic_planner_skill is None else self.config.n_action_steps
+        history = [entry["skill"] for entry in self.atomic_planner_history if not entry["parse_failure"]]
         return (
-            "Choose the current robot manipulation skill from pick, place, push, turn, open, close. "
-            f"Task: {task}\nPrevious skill: {previous}\nActions executed since the previous decision: {steps}\n"
+            "Predict the next robot manipulation skill from pick, place, push, turn, open, close using "
+            "the attached visual observations and executed skill history. "
+            f"Task: {task}\nPrevious skill: {previous}\nExecuted skill history: {json.dumps(history)}\n"
             "Return exactly one JSON object and no other text: "
-            '{"decision":"continue|switch","skill":"pick|place|push|turn|open|close"}'
+            '{"skill":"pick|place|push|turn|open|close"}'
         )
 
     def replan_atomic_skill(self, batch: dict[str, Tensor]) -> Tensor:
@@ -419,9 +413,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         prompt = self._atomic_planner_prompt(task)
         started = time.perf_counter()
         raw_output = self.model.vlm_with_expert.generate_atomic_planner_output(images, prompt)
-        previous = None if self._atomic_planner_skill is None else ATOMIC_SKILLS[self._atomic_planner_skill]
         try:
-            decision, skill_id = parse_atomic_planner_output(raw_output, previous)
+            skill_id = parse_atomic_planner_output(raw_output)
         except ValueError as error:
             self._atomic_planner_consecutive_failures += 1
             self.atomic_planner_history.append(
@@ -439,14 +432,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
 
         self._atomic_planner_consecutive_failures = 0
-        if decision == "switch":
+        if skill_id != self._atomic_planner_skill:
             self._queues[ACTION].clear()
         self._atomic_planner_skill = skill_id
+        logger.info("Atomic planner predicted skill: %s", ATOMIC_SKILLS[skill_id])
         self.atomic_planner_history.append(
             {
                 "prompt": prompt,
                 "raw_output": raw_output,
-                "decision": decision,
                 "skill": ATOMIC_SKILLS[skill_id],
                 "parse_failure": False,
                 "latency_s": time.perf_counter() - started,

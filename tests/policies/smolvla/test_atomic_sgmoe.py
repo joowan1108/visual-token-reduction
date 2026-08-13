@@ -183,22 +183,20 @@ def test_select_action_uses_frozen_planner_at_each_queue_refill(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("raw", "previous"),
+    "raw",
     [
-        ('{"decision":"continue","skill":"pick"}', None),
-        ('{"decision":"continue","skill":"place"}', "pick"),
-        ('{"decision":"switch","skill":"pick"}', "pick"),
-        ('{"decision":"switch","skill":"pick","extra":1}', None),
-        ('{"decision":"switch","decision":"continue","skill":"pick"}', None),
-        ('{"decision":"switch","skill":"pick"} trailing', None),
+        '{"skill":"invalid"}',
+        '{"skill":"pick","extra":1}',
+        '{"skill":"pick","skill":"place"}',
+        '{"skill":"pick"} trailing',
     ],
 )
-def test_atomic_planner_parser_rejects_non_strict_or_inconsistent_json(raw, previous):
+def test_atomic_planner_parser_rejects_non_strict_json(raw):
     with pytest.raises(ValueError):
-        parse_atomic_planner_output(raw, previous)
+        parse_atomic_planner_output(raw)
 
 
-def test_atomic_planner_state_machine_switch_continue_and_failures():
+def test_atomic_planner_uses_skill_history_and_records_predictions(caplog):
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     policy.config = SimpleNamespace(
         image_features={"observation.images.main": None, "observation.images.wrist": None},
@@ -210,14 +208,20 @@ def test_atomic_planner_state_machine_switch_continue_and_failures():
     policy.atomic_planner_history = []
     outputs = iter(
         [
-            '{"decision":"switch","skill":"pick"}',
-            '{"decision":"continue","skill":"pick"}',
-            '{"decision":"switch","skill":"place"}',
+            '{"skill":"pick"}',
+            '{"skill":"pick"}',
+            '{"skill":"place"}',
             "invalid",
             "invalid",
         ]
     )
-    generator = SimpleNamespace(generate_atomic_planner_output=lambda images, prompt: next(outputs))
+    prompts = []
+
+    def generate(images, prompt):
+        prompts.append(prompt)
+        return next(outputs)
+
+    generator = SimpleNamespace(generate_atomic_planner_output=generate)
     policy.model = SimpleNamespace(vlm_with_expert=generator)
     batch = {
         OBS_STATE: torch.zeros(1, 8),
@@ -226,16 +230,25 @@ def test_atomic_planner_state_machine_switch_continue_and_failures():
         "observation.images.wrist": torch.zeros(1, 3, 8, 8),
     }
 
-    assert policy.replan_atomic_skill(batch).item() == 0
-    assert not policy._queues[ACTION]
-    policy._queues[ACTION].append(torch.ones(1, 1))
-    assert policy.replan_atomic_skill(batch).item() == 0
-    assert len(policy._queues[ACTION]) == 1
-    assert policy.replan_atomic_skill(batch).item() == 1
-    assert not policy._queues[ACTION]
-    assert policy.replan_atomic_skill(batch).item() == 1
-    with pytest.raises(AtomicPlannerEpisodeFailure):
-        policy.replan_atomic_skill(batch)
+    with caplog.at_level("INFO"):
+        assert policy.replan_atomic_skill(batch).item() == 0
+        assert not policy._queues[ACTION]
+        policy._queues[ACTION].append(torch.ones(1, 1))
+        assert policy.replan_atomic_skill(batch).item() == 0
+        assert len(policy._queues[ACTION]) == 1
+        assert policy.replan_atomic_skill(batch).item() == 1
+        assert not policy._queues[ACTION]
+        assert policy.replan_atomic_skill(batch).item() == 1
+        with pytest.raises(AtomicPlannerEpisodeFailure):
+            policy.replan_atomic_skill(batch)
+    assert "Executed skill history: []" in prompts[0]
+    assert 'Executed skill history: ["pick"]' in prompts[1]
+    assert 'Executed skill history: ["pick", "pick"]' in prompts[2]
+    assert [record.message for record in caplog.records] == [
+        "Atomic planner predicted skill: pick",
+        "Atomic planner predicted skill: pick",
+        "Atomic planner predicted skill: place",
+    ]
     assert [entry["parse_failure"] for entry in policy.atomic_planner_history] == [
         False,
         False,
@@ -259,6 +272,8 @@ def test_first_atomic_planner_parse_failure_ends_episode():
         policy.replan_atomic_skill(
             {OBS_STATE: torch.zeros(1, 1), "task": ["task"], "image": torch.zeros(1, 3, 4, 4)}
         )
+
+
 def test_train_expert_only_can_train_only_the_vision_encoder():
     model = SmolVLMWithExpertModel.__new__(SmolVLMWithExpertModel)
     nn.Module.__init__(model)
