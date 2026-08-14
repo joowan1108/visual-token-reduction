@@ -294,6 +294,8 @@ class SmolVLMWithExpertModel(nn.Module):
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
+        self.model_id = model_id
+        self._atomic_planner = None
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -642,6 +644,19 @@ class SmolVLMWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
+    def _get_atomic_planner(self):
+        if self._atomic_planner is None:
+            device = next(self.vlm.parameters()).device
+            planner = AutoModelForImageTextToText.from_pretrained(
+                self.model_id,
+                dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            ).to(device)
+            planner.requires_grad_(False).eval()
+            # Keep the inference-only planner out of policy checkpoints.
+            self._atomic_planner = (planner, AutoProcessor.from_pretrained(self.model_id))
+        return self._atomic_planner
+
     @torch.no_grad()
     def generate_atomic_planner_output(
         self, images: list[torch.Tensor], prompt: str, max_new_tokens: int = 32
@@ -664,17 +679,18 @@ class SmolVLMWithExpertModel(nn.Module):
             pixels = (image * 255).round().to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
             pil_images.append(Image.fromarray(pixels))
 
+        planner, processor = self._get_atomic_planner()
         content = [{"type": "image"} for _ in pil_images]
         content.append({"type": "text", "text": prompt})
-        text = self.processor.apply_chat_template(
+        text = processor.apply_chat_template(
             [{"role": "user", "content": content}], add_generation_prompt=True
         )
-        inputs = self.processor(text=[text], images=[pil_images], padding=True, return_tensors="pt")
-        device = next(self.vlm.parameters()).device
+        inputs = processor(text=[text], images=[pil_images], padding=True, return_tensors="pt")
+        device = next(planner.parameters()).device
         inputs = {key: value.to(device) for key, value in inputs.items()}
         input_length = inputs["input_ids"].shape[1]
-        generated = self.vlm.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
-        return self.processor.batch_decode(
+        generated = planner.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
+        return processor.batch_decode(
             generated[:, input_length:], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
 
