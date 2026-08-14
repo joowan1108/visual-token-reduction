@@ -594,6 +594,12 @@ def eval_policy(
         all_policy_failures.extend(batch_policy_failures.tolist())
         planner_history = deepcopy(getattr(policy, "atomic_planner_history", []))
         all_planner_histories.extend([planner_history] * env.num_envs)
+        if planner_history:
+            logger.info(
+                "Atomic planner skill timeline (episode %d): %s",
+                batch_ix * env.num_envs,
+                [entry["skill"] for entry in planner_history if not entry["parse_failure"]],
+            )
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -861,6 +867,7 @@ class TaskMetrics(TypedDict):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
+    atomic_planner_skill_timelines: list[list[str]]
     video_paths: list[str]
     predicted_video_paths: list[str]
 
@@ -913,6 +920,10 @@ def eval_one(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
+        atomic_planner_skill_timelines=[
+            [entry["skill"] for entry in ep["atomic_planner_history"] if not entry["parse_failure"]]
+            for ep in per_episode
+        ],
         video_paths=task_result.get("video_paths", []),
         predicted_video_paths=task_result.get("predicted_video_paths", []),
     )

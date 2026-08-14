@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import lerobot.policies.smolvla.smolvlm_with_expert as smolvlm_with_expert
 from lerobot.datasets.sampler import AtomicSkillSampler
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
@@ -185,13 +186,13 @@ def test_select_action_uses_frozen_planner_at_each_queue_refill(monkeypatch):
 @pytest.mark.parametrize(
     "raw",
     [
-        '{"skill":"invalid"}',
-        '{"skill":"pick","extra":1}',
-        '{"skill":"pick","skill":"place"}',
-        '{"skill":"pick"} trailing',
+        "invalid",
+        "pick place",
+        '{"skill":"pick"}',
+        "pick\nplace",
     ],
 )
-def test_atomic_planner_parser_rejects_non_strict_json(raw):
+def test_atomic_planner_parser_rejects_non_skill_word(raw):
     with pytest.raises(ValueError):
         parse_atomic_planner_output(raw)
 
@@ -208,9 +209,9 @@ def test_atomic_planner_uses_skill_history_and_records_predictions(caplog):
     policy.atomic_planner_history = []
     outputs = iter(
         [
-            '{"skill":"pick"}',
-            '{"skill":"pick"}',
-            '{"skill":"place"}',
+            "pick",
+            "pick",
+            "place",
             "invalid",
             "invalid",
         ]
@@ -241,9 +242,9 @@ def test_atomic_planner_uses_skill_history_and_records_predictions(caplog):
         assert policy.replan_atomic_skill(batch).item() == 1
         with pytest.raises(AtomicPlannerEpisodeFailure):
             policy.replan_atomic_skill(batch)
-    assert "Executed skill history: []" in prompts[0]
-    assert 'Executed skill history: ["pick"]' in prompts[1]
-    assert 'Executed skill history: ["pick", "pick"]' in prompts[2]
+    assert "Executed skill history: none" in prompts[0]
+    assert "Executed skill history: pick" in prompts[1]
+    assert "Executed skill history: pick, pick" in prompts[2]
     assert [record.message for record in caplog.records] == [
         "Atomic planner predicted skill: pick",
         "Atomic planner predicted skill: pick",
@@ -272,6 +273,35 @@ def test_first_atomic_planner_parse_failure_ends_episode():
         policy.replan_atomic_skill(
             {OBS_STATE: torch.zeros(1, 1), "task": ["task"], "image": torch.zeros(1, 3, 4, 4)}
         )
+
+
+def test_atomic_planner_loads_full_model_once_without_registering(monkeypatch):
+    model = SmolVLMWithExpertModel.__new__(SmolVLMWithExpertModel)
+    nn.Module.__init__(model)
+    model.vlm = nn.Linear(1, 1, bias=False)
+    model.vlm.requires_grad_(False)
+    model.model_id = "planner"
+    model._atomic_planner = None
+    planner = nn.Linear(1, 1)
+    processor = object()
+    loads = []
+
+    monkeypatch.setattr(
+        smolvlm_with_expert.AutoModelForImageTextToText,
+        "from_pretrained",
+        lambda *args, **kwargs: loads.append((args, kwargs)) or planner,
+    )
+    monkeypatch.setattr(
+        smolvlm_with_expert.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: processor,
+    )
+
+    assert model._get_atomic_planner() == (planner, processor)
+    assert model._get_atomic_planner() == (planner, processor)
+    assert len(loads) == 1
+    assert not any(parameter.requires_grad for parameter in planner.parameters())
+    assert planner not in model.children()
 
 
 def test_train_expert_only_can_train_only_the_vision_encoder():
