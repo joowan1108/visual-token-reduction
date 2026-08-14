@@ -17,3 +17,8 @@ and action-policy checkpoints are unchanged.
 
 Held-out classifier evaluation excludes episode starts from transition metrics and reports stay accuracy plus
 binary switch precision and recall. A predicted skill different from the previous skill is a predicted switch.
+
+After the first classifier run showed that natural frame sampling produced almost no true-positive switches,
+classifier training was amended to draw 75% stay frames and 25% event frames. Event frames are episode starts
+plus the current frame where the mapped atomic skill changes; the earlier skill-linking convention of sampling
+`boundary - action_horizon` is not used. Held-out evaluation keeps the natural, unsampled distribution.

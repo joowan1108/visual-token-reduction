@@ -195,6 +195,24 @@ def test_atomic_sampler_is_balanced_deterministic_and_resumable():
         AtomicSkillSampler([0], [6], list(range(6)), [0, 1, 2, 3, 4, 5, 0])
 
 
+def test_atomic_classifier_sampler_draws_current_boundaries_75_25():
+    labels = [0, 0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
+    sampler = AtomicSkillSampler(
+        [0],
+        [len(labels)],
+        subtask_indices=labels,
+        subtask_to_skill=[0, 0, 1, 2, 3, 4, 5],
+        seed=42,
+        classifier_event_sampling=True,
+    )
+    samples = list(sampler)
+
+    assert sampler.classifier_candidate_counts == {"stay": 7, "start": 1, "switch": 5}
+    assert set(sampler.event_candidates) == {0, 3, 5, 7, 9, 11}
+    assert all(sample in sampler.event_candidates for sample in samples[3::4])
+    assert all(sample not in sampler.event_candidates for offset in range(3) for sample in samples[offset::4])
+
+
 def test_select_action_forwards_atomic_skill(monkeypatch):
     from lerobot.policies.smolvla import modeling_smolvla
 

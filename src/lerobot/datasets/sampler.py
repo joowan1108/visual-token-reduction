@@ -347,7 +347,7 @@ class SkillLinkingSampler(EpisodeAwareSampler):
 
 
 class AtomicSkillSampler(EpisodeAwareSampler):
-    """Deterministically balance six atomic skills with replacement."""
+    """Balance six atomic skills, optionally mixing classifier events 75:25."""
 
     def __init__(
         self,
@@ -358,6 +358,7 @@ class AtomicSkillSampler(EpisodeAwareSampler):
         episode_indices_to_use: list | None = None,
         seed: int = 0,
         absolute_to_relative_idx: dict[int, int] | None = None,
+        classifier_event_sampling: bool = False,
     ):
         super().__init__(
             dataset_from_indices,
@@ -380,8 +381,12 @@ class AtomicSkillSampler(EpisodeAwareSampler):
             episode_mask[:] = False
             episode_mask[np.asarray(episode_indices_to_use, dtype=np.int64)] = True
 
+        self._classifier_event_sampling = classifier_event_sampling
+        self._start_candidates: list[int] = []
+        self._boundary_candidates: list[int] = []
         self._skill_candidates = [[] for _ in range(6)]
         for start, end in zip(from_indices[episode_mask], to_indices[episode_mask], strict=True):
+            previous_skill = None
             for absolute_idx in range(int(start), int(end)):
                 relative_idx = (
                     absolute_idx
@@ -391,12 +396,54 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                 label = int(labels[relative_idx])
                 if not 0 <= label < len(mapping):
                     raise ValueError(f"Subtask index {label} is outside the frozen atomic mapping.")
-                self._skill_candidates[int(mapping[label])].append(relative_idx)
+                skill = int(mapping[label])
+                if classifier_event_sampling and absolute_idx == start:
+                    self._start_candidates.append(relative_idx)
+                elif classifier_event_sampling and skill != previous_skill:
+                    self._boundary_candidates.append(relative_idx)
+                else:
+                    self._skill_candidates[skill].append(relative_idx)
+                previous_skill = skill
         if any(not candidates for candidates in self._skill_candidates):
             raise ValueError("Every atomic skill must have at least one train anchor.")
+        self._event_candidates = [*self._start_candidates, *self._boundary_candidates]
+        if classifier_event_sampling:
+            if not self._boundary_candidates:
+                raise ValueError("Atomic classifier sampling found no skill boundaries.")
+            self._num_frames = 4 * math.ceil(self._num_frames / 4)
+
+    @property
+    def classifier_candidate_counts(self) -> dict[str, int]:
+        return {
+            "stay": sum(map(len, self._skill_candidates)),
+            "start": len(self._start_candidates),
+            "switch": len(self._boundary_candidates),
+        }
+
+    @property
+    def event_candidates(self) -> list[int]:
+        return list(self._event_candidates)
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         generator = self._epoch_generator(epoch)
+        if self._classifier_event_sampling:
+            num_regular = 3 * (self._num_frames // 4)
+            regular_skills = torch.arange(num_regular) % 6
+            regular_skills = regular_skills[torch.randperm(num_regular, generator=generator)]
+            regular_position = 0
+            for position in range(self._num_frames):
+                if position % 4 == 3:
+                    candidate = self._event_candidates[
+                        torch.randint(len(self._event_candidates), (), generator=generator).item()
+                    ]
+                else:
+                    candidates = self._skill_candidates[int(regular_skills[regular_position])]
+                    regular_position += 1
+                    candidate = candidates[torch.randint(len(candidates), (), generator=generator).item()]
+                if position >= start:
+                    yield candidate
+            return
+
         skill_order = torch.arange(self._num_frames) % 6
         skill_order = skill_order[torch.randperm(self._num_frames, generator=generator)]
         for position in range(self._num_frames):

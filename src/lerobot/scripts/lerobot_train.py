@@ -392,7 +392,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             episode_indices_to_use=dataset.episodes,
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            classifier_event_sampling=getattr(active_cfg, "atomic_classifier_enabled", False),
         )
+        if is_main_process and getattr(active_cfg, "atomic_classifier_enabled", False):
+            counts = atomic_sampler.classifier_candidate_counts
+            logging.info(
+                "Atomic classifier sampler: 75%% stay / 25%% event; candidates=%s",
+                counts,
+            )
 
     if cfg.is_reward_model_training:
         if is_main_process:
