@@ -1473,7 +1473,7 @@ class VLAFlowMatching(nn.Module):
             position_ids=torch.cumsum(prefix_pad_masks, dim=1) - 1,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=False,
+            use_cache=True,
         )
         prefix_out = prefix_outputs[0]
         visual_tokens = torch.cat([prefix_out[:, start:end] for start, end in visual_token_spans], dim=1)

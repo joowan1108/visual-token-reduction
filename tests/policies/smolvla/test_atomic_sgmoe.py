@@ -12,6 +12,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
     AtomicPlannerEpisodeFailure,
     SmolVLAPolicy,
+    VLAFlowMatching,
     atomic_classifier_event_counts,
     parse_atomic_planner_output,
 )
@@ -149,6 +150,26 @@ def test_atomic_classifier_event_counts_exclude_episode_starts():
         "atomic_switch_actual": 2,
         "atomic_switch_predicted": 3,
     }
+
+
+def test_atomic_classifier_prefix_prefill_skips_missing_expert_tokens():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    prefix = torch.zeros(1, 4, 3)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    model.embed_prefix = lambda *args, **kwargs: (prefix, mask, torch.zeros_like(mask), ((0, 1),), (1, 3))
+
+    class PrefixOnlyVLM(nn.Module):
+        def forward(self, **kwargs):
+            assert kwargs["inputs_embeds"][1] is None
+            assert kwargs["use_cache"] is True
+            return [prefix], None
+
+    model.vlm_with_expert = PrefixOnlyVLM()
+    model.atomic_previous_skill_embedding = nn.Embedding(7, 3)
+    model.atomic_classifier = lambda *args: torch.zeros(1, 6)
+    logits = model.classify_atomic_skill(None, None, None, None, torch.zeros(1, 2), torch.tensor([6]))
+    assert logits.shape == (1, 6)
 
 
 def test_atomic_sampler_is_balanced_deterministic_and_resumable():
