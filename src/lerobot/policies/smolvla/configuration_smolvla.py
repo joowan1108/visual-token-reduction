@@ -75,6 +75,7 @@ class SmolVLAConfig(PreTrainedConfig):
     atomic_data_enabled: bool = False
     atomic_sgmoe_enabled: bool = False
     atomic_planner_enabled: bool = False
+    atomic_classifier_enabled: bool = False
     atomic_subtask_to_skill: list[int] | None = None
     atomic_subtask_to_skill_path: str | None = None
 
@@ -185,6 +186,8 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.skill_linking_enabled:
             if self.skill_linking_num_skills <= 0:
                 raise ValueError("`skill_linking_num_skills` must be positive.")
+            if not self.train_expert_only or not self.freeze_vision_encoder:
+                raise ValueError("Skill linking requires a frozen VLM and vision encoder.")
             if self.n_action_steps <= 0:
                 raise ValueError("Skill linking requires `n_action_steps > 0`.")
             if self.compile_model:
@@ -235,6 +238,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 )
             if not self.load_vlm_weights:
                 raise ValueError("The frozen atomic planner requires `load_vlm_weights=True`.")
+        if self.atomic_classifier_enabled:
+            if not self.atomic_sgmoe_enabled:
+                raise ValueError("The atomic classifier requires `atomic_sgmoe_enabled=True`.")
+            if self.atomic_planner_enabled:
+                raise ValueError("The atomic classifier and generative planner are mutually exclusive.")
+            if not self.train_expert_only or not self.freeze_vision_encoder:
+                raise ValueError("The atomic classifier requires a fully frozen action-policy backbone.")
         if self.phase_camera_masking_enabled:
             if self.skill_linking_enabled:
                 raise ValueError("Phase-aware masking and semantic skill linking are separate experiments.")
@@ -302,7 +312,7 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def subtask_delta_indices(self) -> list[int] | None:
         if self.atomic_data_enabled:
-            return list(range(self.chunk_size))
+            return ([-1] if self.atomic_classifier_enabled else []) + list(range(self.chunk_size))
         return list(range(self.n_action_steps + 1)) if self.skill_linking_enabled else None
 
     @property

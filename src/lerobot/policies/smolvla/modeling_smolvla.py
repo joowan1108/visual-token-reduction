@@ -289,7 +289,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def predict_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
-        if self._skill_linking_enabled() or self._phase_masking_enabled() or self._atomic_planner_enabled():
+        if (
+            self._skill_linking_enabled()
+            or self._phase_masking_enabled()
+            or self._atomic_planner_enabled()
+            or self._atomic_classifier_enabled()
+        ):
             raise RuntimeError(
                 "Stateful skill/phase/planner prediction supports synchronous select_action only."
             )
@@ -322,12 +327,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if self._check_get_actions_condition():
             atomic_skill_id = kwargs.get("atomic_skill_id")
-            if self._atomic_planner_enabled():
+            if self._atomic_planner_enabled() or self._atomic_classifier_enabled():
                 if atomic_skill_id is not None:
                     raise ValueError(
-                        "Do not manually pass `atomic_skill_id` while the frozen atomic planner is enabled."
+                        "Do not manually pass `atomic_skill_id` while atomic skill prediction is enabled."
                     )
-                atomic_skill_id = self.replan_atomic_skill(batch)
+                atomic_skill_id = (
+                    self.replan_atomic_skill_classifier(batch)
+                    if self._atomic_classifier_enabled()
+                    else self.replan_atomic_skill(batch)
+                )
             current_skill = None
             current_phase = None
             if self._skill_linking_enabled():
@@ -367,6 +376,42 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _atomic_planner_enabled(self) -> bool:
         return getattr(self.config, "atomic_planner_enabled", False)
+
+    def _atomic_classifier_enabled(self) -> bool:
+        return getattr(self.config, "atomic_classifier_enabled", False)
+
+    def replan_atomic_skill_classifier(self, batch: dict[str, Tensor]) -> Tensor:
+        if batch[OBS_STATE].shape[0] != 1:
+            raise ValueError("Atomic classifier evaluation requires sequential batch-size-1 rollouts.")
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        previous_skill = (
+            len(ATOMIC_SKILLS) if self._atomic_planner_skill is None else self._atomic_planner_skill
+        )
+        started = time.perf_counter()
+        logits = self.model.classify_atomic_skill(
+            images,
+            img_masks,
+            batch[f"{OBS_LANGUAGE_TOKENS}"],
+            batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"],
+            state,
+            torch.tensor([previous_skill], device=state.device),
+        )
+        skill_id = int(logits.argmax(dim=-1).item())
+        if skill_id != self._atomic_planner_skill:
+            self._queues[ACTION].clear()
+        self._atomic_planner_skill = skill_id
+        skill = ATOMIC_SKILLS[skill_id]
+        logger.info("Atomic classifier predicted skill: %s", skill)
+        self.atomic_planner_history.append(
+            {
+                "skill": skill,
+                "parse_failure": False,
+                "logits": logits[0].float().cpu().tolist(),
+                "latency_s": time.perf_counter() - started,
+            }
+        )
+        return torch.tensor([skill_id], dtype=torch.long, device=batch[OBS_STATE].device)
 
     def _atomic_planner_prompt(self, task: str) -> str:
         previous = "none" if self._atomic_planner_skill is None else ATOMIC_SKILLS[self._atomic_planner_skill]
@@ -450,7 +495,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise KeyError("Atomic data handling requires `subtask_index` and `subtask_index_is_pad`.")
         if labels.ndim != 2 or labels.shape != labels_is_pad.shape:
             raise ValueError("Atomic subtask labels and padding mask must be aligned rank-2 tensors.")
-        if labels.shape[1] != self.config.chunk_size or labels_is_pad[:, 0].any():
+        anchor = 1 if self._atomic_classifier_enabled() else 0
+        if labels.shape[1] != self.config.chunk_size + anchor or labels_is_pad[:, anchor].any():
             raise ValueError("Atomic subtask windows must cover the chunk and have an unpadded anchor.")
 
         mapping = torch.tensor(self.config.atomic_subtask_to_skill, device=labels.device)
@@ -459,9 +505,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError("Atomic subtask index is outside the frozen mapping vocabulary.")
         safe_labels = labels.long().clamp(0, mapping.numel() - 1)
         skills = mapping[safe_labels]
+        skills = skills[:, anchor:]
+        labels_is_pad = labels_is_pad[:, anchor:].bool()
         current_skill = skills[:, 0]
-        boundary_is_pad = labels_is_pad.bool() | (skills != current_skill[:, None])
+        boundary_is_pad = labels_is_pad | (skills != current_skill[:, None])
         return current_skill, boundary_is_pad
+
+    def _atomic_classifier_targets(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        current_skill, _ = self._atomic_batch_contract(batch)
+        labels = batch["subtask_index"]
+        labels_is_pad = batch["subtask_index_is_pad"].bool()
+        mapping = torch.tensor(self.config.atomic_subtask_to_skill, device=labels.device)
+        previous_skill = torch.full_like(current_skill, len(ATOMIC_SKILLS))
+        has_previous = ~labels_is_pad[:, 0]
+        previous_skill[has_previous] = mapping[labels[has_previous, 0].long()]
+        return current_skill, previous_skill
 
     def _ensure_phase_state(self, batch_size: int, device: torch.device) -> None:
         if torch.is_tensor(self._current_phase):
@@ -607,6 +665,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             allowed_missing = (
                 {key for key in current if ".atomic_router." in key} if promoted_from_dense else set()
             )
+            classifier_keys = {
+                key
+                for key in current
+                if key.startswith("model.atomic_classifier.")
+                or key.startswith("model.atomic_previous_skill_embedding.")
+            }
+            present_classifier_keys = classifier_keys & set(checkpoint)
+            if present_classifier_keys and present_classifier_keys != classifier_keys:
+                raise ValueError("Partial atomic classifier checkpoint is not allowed.")
+            if not present_classifier_keys:
+                allowed_missing |= classifier_keys
             incompatible = model.load_state_dict(checkpoint, strict=False)
             if set(incompatible.missing_keys) - allowed_missing:
                 raise ValueError(f"Missing non-router keys in Atomic checkpoint: {incompatible.missing_keys}")
@@ -689,6 +758,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        if self._atomic_classifier_enabled():
+            target, previous_skill = self._atomic_classifier_targets(batch)
+            logits = self.model.classify_atomic_skill(
+                images, img_masks, lang_tokens, lang_masks, state, previous_skill
+            )
+            losses = F.cross_entropy(logits, target, reduction="none")
+            loss_dict = {
+                "atomic_classifier_loss": losses.mean().item(),
+                "atomic_classifier_accuracy": (logits.argmax(dim=-1) == target).float().mean().item(),
+                "loss": losses.mean().item(),
+            }
+            return (losses if reduction == "none" else losses.mean()), loss_dict
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         atomic_skill_id = None
@@ -986,6 +1067,45 @@ class SkillTransitionHead(nn.Module):
         return logits
 
 
+class AtomicSkillClassifier(nn.Module):
+    def __init__(self, vlm_dim: int, hidden_dim: int, state_dim: int):
+        super().__init__()
+        self.visual_proj = nn.Linear(vlm_dim, hidden_dim)
+        self.task_proj = nn.Linear(vlm_dim, hidden_dim)
+        self.state_proj = nn.Linear(state_dim, hidden_dim)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 4),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(ATOMIC_SKILLS)),
+        )
+
+    def forward(
+        self,
+        visual_tokens: Tensor,
+        visual_mask: Tensor,
+        task_tokens: Tensor,
+        task_mask: Tensor,
+        state: Tensor,
+        previous_skill: Tensor,
+    ) -> Tensor:
+        dtype = self.visual_proj.weight.dtype
+        visual = self.visual_proj(visual_tokens.detach().to(dtype=dtype))
+        task = self.task_proj(task_tokens.detach().to(dtype=dtype))
+        previous_skill = previous_skill.to(dtype=dtype)
+        return self.classifier(
+            torch.cat(
+                [
+                    SkillTransitionHead._pool(visual, visual_mask, previous_skill),
+                    SkillTransitionHead._pool(task, task_mask, previous_skill),
+                    self.state_proj(state.detach().to(dtype=dtype)),
+                    previous_skill,
+                ],
+                dim=-1,
+            )
+        ).float()
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -1054,6 +1174,8 @@ class VLAFlowMatching(nn.Module):
         self.transition_head = None
         self.phase_embedding = None
         self.phase_head = None
+        self.atomic_previous_skill_embedding = None
+        self.atomic_classifier = None
         if self._skill_linking_enabled():
             self.skill_embedding = nn.Embedding(
                 self.config.skill_linking_num_skills + 1, self.vlm_with_expert.expert_hidden_size
@@ -1068,6 +1190,15 @@ class VLAFlowMatching(nn.Module):
             self.phase_embedding = nn.Embedding(2, self.vlm_with_expert.expert_hidden_size)
             nn.init.zeros_(self.phase_embedding.weight)
             self.phase_head = nn.Linear(self.vlm_with_expert.expert_hidden_size, 2)
+        if self._atomic_classifier_enabled():
+            self.atomic_previous_skill_embedding = nn.Embedding(
+                len(ATOMIC_SKILLS) + 1, self.vlm_with_expert.expert_hidden_size
+            )
+            self.atomic_classifier = AtomicSkillClassifier(
+                self.vlm_with_expert.config.text_config.hidden_size,
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.max_state_dim,
+            )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -1096,9 +1227,18 @@ class VLAFlowMatching(nn.Module):
     def _phase_masking_enabled(self) -> bool:
         return getattr(self.config, "phase_camera_masking_enabled", False)
 
+    def _atomic_classifier_enabled(self) -> bool:
+        return getattr(self.config, "atomic_classifier_enabled", False)
+
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+        if self._atomic_classifier_enabled():
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+            for module in (self.atomic_previous_skill_embedding, self.atomic_classifier):
+                for parameter in module.parameters():
+                    parameter.requires_grad = True
 
     def sample_noise(self, shape, device):
         return sample_noise(shape, device)
@@ -1299,6 +1439,36 @@ class VLAFlowMatching(nn.Module):
         horizon = min(self.config.n_action_steps, suffix_out.shape[1])
         pooled = suffix_out[:, :horizon].to(dtype=self.phase_head.weight.dtype).mean(dim=1)
         return self.phase_head(pooled).float()
+
+    def classify_atomic_skill(
+        self, images, img_masks, lang_tokens, lang_masks, state, previous_skill: Tensor
+    ) -> Tensor:
+        (
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            visual_token_spans,
+            task_token_span,
+        ) = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
+        prefix_outputs, _ = self.vlm_with_expert.forward(
+            attention_mask=make_att_2d_masks(prefix_pad_masks, prefix_att_masks),
+            position_ids=torch.cumsum(prefix_pad_masks, dim=1) - 1,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+        prefix_out = prefix_outputs[0]
+        visual_tokens = torch.cat([prefix_out[:, start:end] for start, end in visual_token_spans], dim=1)
+        visual_mask = torch.cat([prefix_pad_masks[:, start:end] for start, end in visual_token_spans], dim=1)
+        task_start, task_end = task_token_span
+        return self.atomic_classifier(
+            visual_tokens,
+            visual_mask,
+            prefix_out[:, task_start:task_end],
+            prefix_pad_masks[:, task_start:task_end],
+            state,
+            self.atomic_previous_skill_embedding(previous_skill.long().to(device=state.device)),
+        )
 
     def forward(
         self,

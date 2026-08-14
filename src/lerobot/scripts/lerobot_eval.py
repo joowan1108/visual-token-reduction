@@ -216,8 +216,12 @@ def rollout(
         The dictionary described above.
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
-    if getattr(getattr(policy, "config", None), "atomic_planner_enabled", False) and env.num_envs != 1:
-        raise ValueError("Frozen atomic planner evaluation requires batch_size=1.")
+    policy_config = getattr(policy, "config", None)
+    atomic_skill_prediction = getattr(policy_config, "atomic_planner_enabled", False) or getattr(
+        policy_config, "atomic_classifier_enabled", False
+    )
+    if atomic_skill_prediction and env.num_envs != 1:
+        raise ValueError("Atomic skill prediction requires batch_size=1.")
 
     # Reset the policy and environments.
     policy.reset()
@@ -596,7 +600,7 @@ def eval_policy(
         all_planner_histories.extend([planner_history] * env.num_envs)
         if planner_history:
             logger.info(
-                "Atomic planner skill timeline (episode %d): %s",
+                "Atomic skill timeline (episode %d): %s",
                 batch_ix * env.num_envs,
                 [entry["skill"] for entry in planner_history if not entry["parse_failure"]],
             )

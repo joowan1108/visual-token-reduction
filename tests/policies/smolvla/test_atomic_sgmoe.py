@@ -52,6 +52,16 @@ def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
     )
     assert planner.atomic_planner_enabled
 
+    classifier = SmolVLAConfig(
+        chunk_size=10,
+        n_action_steps=5,
+        atomic_data_enabled=True,
+        atomic_sgmoe_enabled=True,
+        atomic_classifier_enabled=True,
+        atomic_subtask_to_skill=list(range(6)),
+    )
+    assert classifier.subtask_delta_indices == [-1, *range(10)]
+
     with pytest.raises(ValueError, match="frozen vision encoder"):
         SmolVLAConfig(
             chunk_size=10,
@@ -104,6 +114,25 @@ def test_atomic_boundary_mask_uses_canonical_skill_not_subtask_identity():
     )
     assert skill.tolist() == [1]
     assert action_is_pad.tolist() == [[False, False, True, True]]
+
+
+def test_atomic_classifier_uses_previous_and_current_frame_labels():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        chunk_size=4,
+        atomic_classifier_enabled=True,
+        atomic_subtask_to_skill=list(range(6)),
+    )
+    target, previous = policy._atomic_classifier_targets(
+        {
+            "subtask_index": torch.tensor([[0, 1, 1, 2, 2], [0, 4, 4, 4, 4]]),
+            "subtask_index_is_pad": torch.tensor(
+                [[False, False, False, False, False], [True, False, False, False, False]]
+            ),
+        }
+    )
+    assert target.tolist() == [1, 4]
+    assert previous.tolist() == [0, 6]
 
 
 def test_atomic_sampler_is_balanced_deterministic_and_resumable():
