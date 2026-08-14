@@ -93,6 +93,22 @@ def parse_atomic_planner_output(raw_output: str) -> int:
     return ATOMIC_SKILLS.index(skill)
 
 
+def atomic_classifier_event_counts(
+    prediction: Tensor, target: Tensor, previous_skill: Tensor
+) -> dict[str, int]:
+    has_previous = previous_skill < len(ATOMIC_SKILLS)
+    actual_stay = has_previous & (target == previous_skill)
+    actual_switch = has_previous & (target != previous_skill)
+    predicted_switch = has_previous & (prediction != previous_skill)
+    return {
+        "atomic_stay_correct": int((actual_stay & (prediction == target)).sum().item()),
+        "atomic_stay_total": int(actual_stay.sum().item()),
+        "atomic_switch_tp": int((actual_switch & predicted_switch).sum().item()),
+        "atomic_switch_actual": int(actual_switch.sum().item()),
+        "atomic_switch_predicted": int(predicted_switch.sum().item()),
+    }
+
+
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
@@ -764,10 +780,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 images, img_masks, lang_tokens, lang_masks, state, previous_skill
             )
             losses = F.cross_entropy(logits, target, reduction="none")
+            prediction = logits.argmax(dim=-1)
             loss_dict = {
                 "atomic_classifier_loss": losses.mean().item(),
-                "atomic_classifier_accuracy": (logits.argmax(dim=-1) == target).float().mean().item(),
+                "atomic_classifier_accuracy": (prediction == target).float().mean().item(),
                 "loss": losses.mean().item(),
+                **atomic_classifier_event_counts(prediction, target, previous_skill),
             }
             return (losses if reduction == "none" else losses.mean()), loss_dict
         actions = self.prepare_action(batch)

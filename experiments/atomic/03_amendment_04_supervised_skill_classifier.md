@@ -14,3 +14,6 @@ SG-MoE checkpoint and remain frozen; only the classifier and previous-skill embe
 This is a post-result protocol amendment. Classifier-routed results must be reported separately from the
 preregistered zero-shot generative-planner result and cannot replace it. Primary metrics, task manifests, seeds,
 and action-policy checkpoints are unchanged.
+
+Held-out classifier evaluation excludes episode starts from transition metrics and reports stay accuracy plus
+binary switch precision and recall. A predicted skill different from the previous skill is a predicted switch.

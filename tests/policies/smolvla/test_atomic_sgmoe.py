@@ -12,6 +12,7 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
     AtomicPlannerEpisodeFailure,
     SmolVLAPolicy,
+    atomic_classifier_event_counts,
     parse_atomic_planner_output,
 )
 from lerobot.policies.smolvla.smolvlm_with_expert import (
@@ -133,6 +134,21 @@ def test_atomic_classifier_uses_previous_and_current_frame_labels():
     )
     assert target.tolist() == [1, 4]
     assert previous.tolist() == [0, 6]
+
+
+def test_atomic_classifier_event_counts_exclude_episode_starts():
+    counts = atomic_classifier_event_counts(
+        prediction=torch.tensor([1, 2, 3, 3, 0]),
+        target=torch.tensor([1, 2, 3, 3, 5]),
+        previous_skill=torch.tensor([1, 1, 4, 2, 6]),
+    )
+    assert counts == {
+        "atomic_stay_correct": 1,
+        "atomic_stay_total": 2,
+        "atomic_switch_tp": 2,
+        "atomic_switch_actual": 2,
+        "atomic_switch_predicted": 3,
+    }
 
 
 def test_atomic_sampler_is_balanced_deterministic_and_resumable():

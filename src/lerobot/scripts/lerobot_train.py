@@ -749,24 +749,60 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            atomic_count_keys = (
+                "atomic_stay_correct",
+                "atomic_stay_total",
+                "atomic_switch_tp",
+                "atomic_switch_actual",
+                "atomic_switch_predicted",
+            )
+            atomic_counts = torch.zeros(len(atomic_count_keys), device=device)
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     for cam_key in dataset.meta.camera_keys:
                         if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
                             eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
                     eval_batch = preprocessor(eval_batch)
-                    loss, _ = policy.forward(eval_batch)
+                    loss, eval_output = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
+                    if getattr(active_cfg, "atomic_classifier_enabled", False):
+                        atomic_counts += torch.tensor(
+                            [eval_output[key] for key in atomic_count_keys], device=device
+                        )
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            atomic_counts = accelerator.reduce(atomic_counts, reduction="sum").tolist()
             policy.train()
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                eval_metrics = {"eval_loss": eval_loss}
+                if getattr(active_cfg, "atomic_classifier_enabled", False):
+                    stay_correct, stay_total, switch_tp, switch_actual, switch_predicted = atomic_counts
+                    eval_metrics.update(
+                        {
+                            "eval_atomic_stay_accuracy": stay_correct / stay_total
+                            if stay_total
+                            else float("nan"),
+                            "eval_atomic_switch_recall": switch_tp / switch_actual
+                            if switch_actual
+                            else float("nan"),
+                            "eval_atomic_switch_precision": switch_tp / switch_predicted
+                            if switch_predicted
+                            else float("nan"),
+                        }
+                    )
+                    logging.info(
+                        "step %d: stay_accuracy=%.4f switch_recall=%.4f switch_precision=%.4f",
+                        step,
+                        eval_metrics["eval_atomic_stay_accuracy"],
+                        eval_metrics["eval_atomic_switch_recall"],
+                        eval_metrics["eval_atomic_switch_precision"],
+                    )
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    wandb_logger.log_dict(eval_metrics, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
