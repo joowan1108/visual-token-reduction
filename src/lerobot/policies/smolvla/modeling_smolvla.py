@@ -373,10 +373,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         history = [entry["skill"] for entry in self.atomic_planner_history if not entry["parse_failure"]]
         history_text = ", ".join(history) if history else "none"
         return (
-            "Predict the next robot manipulation skill from pick, place, push, turn, open, close using "
-            "the attached visual observations and executed skill history. "
+            "Choose the next skill based on the current images.\n\n"
+            "pick: the gripper is not holding the target and must grasp it\n"
+            "place: the gripper is holding the target and must release it at the destination\n"
+            "push: move an object by pushing without grasping\n"
+            "turn: rotate a knob or switch\n"
+            "open: open a drawer, cabinet, or appliance\n"
+            "close: close a drawer, cabinet, or appliance\n\n"
+            "Output exactly one word from:\n"
+            "pick, place, push, turn, open, close\n\n"
             f"Task: {task}\nPrevious skill: {previous}\nExecuted skill history: {history_text}\n"
-            "Return exactly one skill word and no other text."
+            "Answer:"
         )
 
     def replan_atomic_skill(self, batch: dict[str, Tensor]) -> Tensor:

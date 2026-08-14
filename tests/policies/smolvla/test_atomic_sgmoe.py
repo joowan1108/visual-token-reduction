@@ -245,6 +245,8 @@ def test_atomic_planner_uses_skill_history_and_records_predictions(caplog):
     assert "Executed skill history: none" in prompts[0]
     assert "Executed skill history: pick" in prompts[1]
     assert "Executed skill history: pick, pick" in prompts[2]
+    assert "pick: the gripper is not holding the target and must grasp it" in prompts[0]
+    assert "place: the gripper is holding the target" in prompts[0]
     assert [record.message for record in caplog.records] == [
         "Atomic planner predicted skill: pick",
         "Atomic planner predicted skill: pick",
