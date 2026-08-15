@@ -1,5 +1,6 @@
 import math
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +64,8 @@ def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
         atomic_subtask_to_skill=list(range(6)),
     )
     assert classifier.subtask_delta_indices == [-1, *range(10)]
+
+    assert replace(classifier, n_action_steps=10).n_action_steps == 10
 
     with pytest.raises(ValueError, match="frozen vision encoder"):
         SmolVLAConfig(

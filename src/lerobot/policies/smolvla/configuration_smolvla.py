@@ -205,8 +205,8 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.skill_linking_sampler_enabled and self.n_action_steps <= 0:
             raise ValueError("Skill-linking sampling requires `n_action_steps > 0`.")
         if self.atomic_data_enabled:
-            if (self.chunk_size, self.n_action_steps) != (10, 5):
-                raise ValueError("Atomic experiments require chunk_size=10 and n_action_steps=5.")
+            if self.chunk_size != 10 or not 0 < self.n_action_steps <= self.chunk_size:
+                raise ValueError("Atomic experiments require chunk_size=10 and 1 <= n_action_steps <= 10.")
             if self.atomic_subtask_to_skill is None and self.atomic_subtask_to_skill_path is None:
                 raise ValueError(
                     "`atomic_subtask_to_skill` or `atomic_subtask_to_skill_path` is required when atomic data handling is enabled."
