@@ -284,6 +284,50 @@ class LiberoEnv(gym.Env):
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
+    def atomic_oracle_skill(self) -> str:
+        """Return the current atomic skill from privileged LIBERO state."""
+        self._ensure_env()
+        assert self._env is not None
+        inner = self._env.env
+        goals = inner.parsed_problem["goal_state"]
+        unsatisfied = [state for state in goals if not inner._eval_predicate(state)]
+
+        def closed_articulated_region(name: str) -> bool:
+            site = inner.object_sites_dict.get(name)
+            state = inner.object_states_dict.get(name)
+            return bool(site is not None and getattr(site, "joints", ()) and not state.is_open())
+
+        def object_is_held(name: str) -> bool:
+            return bool(inner._check_grasp(inner.robots[0].gripper, inner.get_object(name)))
+
+        for state in unsatisfied:
+            predicate = state[0].lower()
+            if predicate == "close" and any(other[0].lower() != "close" for other in unsatisfied):
+                continue
+            if predicate in {"open", "close"}:
+                return predicate
+            if predicate in {"turnon", "turnoff"}:
+                return "turn"
+            if predicate not in {"on", "in"}:
+                raise RuntimeError(f"Atomic GT routing does not support LIBERO predicate {state[0]!r}.")
+            if self.task_description.lower().startswith("push "):
+                return "push"
+
+            object_name = state[1]
+            if predicate == "in" and closed_articulated_region(state[2]):
+                return "open"
+            for initial_state in inner.parsed_problem["initial_state"]:
+                if (
+                    len(initial_state) == 3
+                    and initial_state[0].lower() == "in"
+                    and initial_state[1] == object_name
+                    and closed_articulated_region(initial_state[2])
+                ):
+                    return "open"
+            return "place" if object_is_held(object_name) else "pick"
+
+        raise RuntimeError("Atomic GT routing was requested after every LIBERO goal was satisfied.")
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None, "_format_raw_obs called before _ensure_env()"
         images = {}

@@ -353,6 +353,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     if self._atomic_classifier_enabled()
                     else self.replan_atomic_skill(batch)
                 )
+            elif atomic_skill_id is not None:
+                if not self.config.atomic_data_enabled or atomic_skill_id.shape != (1,):
+                    raise ValueError("Manual atomic routing requires one skill ID and batch_size=1.")
+                if ((atomic_skill_id < 0) | (atomic_skill_id >= len(ATOMIC_SKILLS))).any():
+                    raise ValueError("Manual atomic skill ID is outside the supported skill vocabulary.")
+                self._atomic_planner_skill = int(atomic_skill_id[0].item())
+                self.atomic_planner_history.append(
+                    {
+                        "skill": ATOMIC_SKILLS[self._atomic_planner_skill],
+                        "parse_failure": False,
+                        "source": "gt_oracle",
+                        "latency_s": 0.0,
+                    }
+                )
             current_skill = None
             current_phase = None
             if self._skill_linking_enabled():

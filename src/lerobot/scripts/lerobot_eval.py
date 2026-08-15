@@ -87,7 +87,7 @@ from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import RolloutEpisodeFailure
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STATE, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
@@ -104,6 +104,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+ATOMIC_SKILLS = ("pick", "place", "push", "turn", "open", "close")
 
 
 def _env_features_to_dataset_features(env_features: dict) -> dict:
@@ -299,7 +300,14 @@ def rollout(
             observation = preprocessor(observation)
             try:
                 with torch.inference_mode():
-                    action = policy.select_action(observation)
+                    if getattr(policy, "atomic_gt_routing", False):
+                        skill = env.call("atomic_oracle_skill")[0]
+                        atomic_skill_id = torch.tensor(
+                            [ATOMIC_SKILLS.index(skill)], device=observation[OBS_STATE].device
+                        )
+                        action = policy.select_action(observation, atomic_skill_id=atomic_skill_id)
+                    else:
+                        action = policy.select_action(observation)
             except RolloutEpisodeFailure as error:
                 if env.num_envs != 1:
                     raise RuntimeError(
@@ -810,6 +818,19 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     policy.eval()
+
+    if cfg.atomic_gt_routing:
+        if cfg.env.type != "libero":
+            raise ValueError("atomic_gt_routing is only supported for LIBERO environments.")
+        if cfg.eval.batch_size != 1 or cfg.env.max_parallel_tasks != 1:
+            raise ValueError("atomic_gt_routing requires eval.batch_size=1 and env.max_parallel_tasks=1.")
+        if not getattr(policy.config, "atomic_data_enabled", False):
+            raise ValueError("atomic_gt_routing requires an atomic SG-MoE checkpoint.")
+        if getattr(policy.config, "atomic_planner_enabled", False) or getattr(
+            policy.config, "atomic_classifier_enabled", False
+        ):
+            raise ValueError("Disable atomic planner and classifier when using atomic_gt_routing.")
+        policy.atomic_gt_routing = True
 
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
