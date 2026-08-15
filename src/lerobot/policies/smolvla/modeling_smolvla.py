@@ -418,7 +418,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             self._queues[ACTION].clear()
         self._atomic_planner_skill = skill_id
         skill = ATOMIC_SKILLS[skill_id]
-        logger.info("Atomic classifier predicted skill: %s", skill)
         self.atomic_planner_history.append(
             {
                 "skill": skill,
