@@ -64,7 +64,11 @@ def should_save_checkpoint(step: int, save_freq: int, total_steps: int) -> bool:
 
 
 def save_training_step(
-    step: int, save_dir: Path, num_processes: int | None = None, batch_size: int | None = None
+    step: int,
+    save_dir: Path,
+    num_processes: int | None = None,
+    batch_size: int | None = None,
+    gradient_accumulation_steps: int | None = None,
 ) -> None:
     state: dict = {"step": step}
     # num_processes and batch_size are recorded so a resumed run can detect a changed world size or
@@ -75,6 +79,8 @@ def save_training_step(
         state["num_processes"] = num_processes
     if batch_size is not None:
         state["batch_size"] = batch_size
+    if gradient_accumulation_steps is not None:
+        state["gradient_accumulation_steps"] = gradient_accumulation_steps
     write_json(state, save_dir / TRAINING_STEP)
 
 
@@ -91,6 +97,11 @@ def load_training_num_processes(checkpoint_dir: Path) -> int | None:
 def load_training_batch_size(checkpoint_dir: Path) -> int | None:
     """Per-process batch size recorded at checkpoint time, or None for older checkpoints."""
     return load_json(checkpoint_dir / TRAINING_STATE_DIR / TRAINING_STEP).get("batch_size")
+
+
+def load_training_gradient_accumulation_steps(checkpoint_dir: Path) -> int | None:
+    """Accumulation count recorded at checkpoint time, or None for older checkpoints."""
+    return load_json(checkpoint_dir / TRAINING_STATE_DIR / TRAINING_STEP).get("gradient_accumulation_steps")
 
 
 def update_last_checkpoint(checkpoint_dir: Path) -> Path:
@@ -112,6 +123,7 @@ def save_checkpoint(
     postprocessor: PolicyProcessorPipeline | None = None,
     num_processes: int | None = None,
     batch_size: int | None = None,
+    gradient_accumulation_steps: int | None = None,
     model_state_dict: dict | None = None,
     optim_state_dict: dict | None = None,
 ) -> None:
@@ -171,6 +183,7 @@ def save_checkpoint(
         scheduler,
         num_processes=num_processes,
         batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         optim_state_dict=optim_state_dict,
     )
 
@@ -182,6 +195,7 @@ def save_training_state(
     scheduler: LRScheduler | None = None,
     num_processes: int | None = None,
     batch_size: int | None = None,
+    gradient_accumulation_steps: int | None = None,
     optim_state_dict: dict | None = None,
 ) -> None:
     """
@@ -201,7 +215,13 @@ def save_training_state(
     """
     save_dir = checkpoint_dir / TRAINING_STATE_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
-    save_training_step(train_step, save_dir, num_processes=num_processes, batch_size=batch_size)
+    save_training_step(
+        train_step,
+        save_dir,
+        num_processes=num_processes,
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+    )
     save_rng_state(save_dir)
     if optimizer is not None:
         save_optimizer_state(optimizer, save_dir, optim_state_dict=optim_state_dict)

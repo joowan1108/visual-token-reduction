@@ -39,6 +39,20 @@ from .rewards import RewardModelConfig
 TRAIN_CONFIG_NAME = "train_config.json"
 
 
+@dataclass
+class GradientAccumulationConfig:
+    steps: int = 1
+
+    def __post_init__(self) -> None:
+        if self.steps < 1:
+            raise ValueError(f"gradient_accumulation.steps must be >= 1, got {self.steps}.")
+
+
+@dataclass
+class AcceleratorConfig:
+    gradient_accumulation: GradientAccumulationConfig = field(default_factory=GradientAccumulationConfig)
+
+
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
     """Return migrated payload for legacy RA-BC fields, or None when no migration is needed."""
     legacy_fields = (
@@ -108,6 +122,7 @@ class TrainPipelineConfig(HubMixin):
     # of inheriting parent state. Override with `--dataloader_multiprocessing_context=fork`
     # when appropriate, or set it to `null` to use Python's platform default.
     dataloader_multiprocessing_context: str | None = "spawn"
+    # Number of optimizer updates. Each update consumes gradient_accumulation.steps micro-batches.
     steps: int = 100_000
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).
     env_eval_freq: int = 20_000
@@ -124,6 +139,7 @@ class TrainPipelineConfig(HubMixin):
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
+    accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
