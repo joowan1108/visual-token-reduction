@@ -46,6 +46,31 @@ def summarize(losses: dict[int, list[float]]) -> dict:
     }
 
 
+def summarize_routes(selected_experts: dict[int, list[int]], weights: dict[int, list[float]]) -> dict:
+    per_skill = {}
+    for skill_id, skill in enumerate(ATOMIC_SKILLS):
+        selected = torch.tensor(selected_experts.get(skill_id, []), dtype=torch.long)
+        gate = torch.tensor(weights.get(skill_id, []), dtype=torch.float64)
+        if selected.numel() == 0:
+            per_skill[skill] = {
+                "count": 0,
+                "route_accuracy": None,
+                "selected_expert": None,
+                "expert_contribution": None,
+                "shared_contribution": None,
+            }
+            continue
+        counts = torch.bincount(selected, minlength=len(ATOMIC_SKILLS))
+        per_skill[skill] = {
+            "count": selected.numel(),
+            "route_accuracy": (selected == skill_id).double().mean().item(),
+            "selected_expert": ATOMIC_SKILLS[counts.argmax().item()],
+            "expert_contribution": gate.mean().item(),
+            "shared_contribution": (1 - gate).mean().item(),
+        }
+    return per_skill
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Measure held-out GT-routed atomic action loss.")
     parser.add_argument("--policy-path", required=True)
@@ -75,6 +100,8 @@ def main() -> None:
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
     if not getattr(policy_cfg, "atomic_data_enabled", False):
         raise ValueError("The checkpoint must use atomic GT labels.")
+    if not getattr(policy_cfg, "atomic_sgmoe_enabled", False):
+        raise ValueError("The checkpoint must use Atomic SG-MoE.")
     if getattr(policy_cfg, "atomic_classifier_enabled", False):
         raise ValueError("Use the SG-MoE action checkpoint from before classifier-only training.")
     policy_cfg.pretrained_path = policy_path
@@ -114,6 +141,9 @@ def main() -> None:
     )
 
     losses: dict[int, list[float]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
+    selected_experts: dict[int, list[int]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
+    route_weights: dict[int, list[float]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
+    router = policy.model.vlm_with_expert.atomic_router
     total_batches = len(dataloader) if args.max_batches == 0 else min(len(dataloader), args.max_batches)
     with torch.inference_mode():
         for batch_index, batch in enumerate(tqdm(dataloader, total=total_batches, desc="GT-routed eval")):
@@ -124,12 +154,18 @@ def main() -> None:
                     batch[camera_key] = batch[camera_key].float() / 255.0
             batch = preprocessor(batch)
             skill_ids, _ = policy._atomic_batch_contract(batch)
+            selected, weights = router(skill_ids)
             sample_loss = torch.zeros(skill_ids.shape[0], device=skill_ids.device)
             for _ in range(args.noise_repeats):
                 repeat_loss, _ = policy.forward(batch, reduction="none")
                 sample_loss += repeat_loss.float() / args.noise_repeats
             for skill_id, loss in zip(skill_ids.tolist(), sample_loss.tolist(), strict=True):
                 losses[skill_id].append(loss)
+            for skill_id, expert_id, weight in zip(
+                skill_ids.tolist(), selected.tolist(), weights.tolist(), strict=True
+            ):
+                selected_experts[skill_id].append(expert_id)
+                route_weights[skill_id].append(weight)
 
     result = {
         "policy_path": str(policy_path),
@@ -139,6 +175,7 @@ def main() -> None:
         "seed": args.seed,
         "noise_repeats": args.noise_repeats,
         **summarize(losses),
+        "routing": summarize_routes(selected_experts, route_weights),
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +191,19 @@ def main() -> None:
                 f"{stats['median']:>12.6f} {stats['p95']:>12.6f}"
             )
     print(f"macro_mean={result['macro_mean']:.6f} micro_mean={result['micro_mean']:.6f}")
+    print()
+    print(
+        f"{'skill':<8} {'route_acc':>10} {'expert':>8} "
+        f"{'expert_share':>13} {'shared_share':>13}"
+    )
+    for skill, stats in result["routing"].items():
+        if stats["route_accuracy"] is None:
+            print(f"{skill:<8} {'n/a':>10}")
+        else:
+            print(
+                f"{skill:<8} {stats['route_accuracy']:>10.2%} {stats['selected_expert']:>8} "
+                f"{stats['expert_contribution']:>13.2%} {stats['shared_contribution']:>13.2%}"
+            )
     print(f"Saved: {output}")
 
 
