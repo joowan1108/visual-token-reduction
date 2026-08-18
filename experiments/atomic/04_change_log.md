@@ -99,3 +99,53 @@ for the same environment reason.
 - Planner mode rejects `freeze_vision_encoder=False`, preserving fully frozen shared-VLM generation.
 - Dense A and SG-MoE B can use the same switch value. The default remains frozen, and no run or raw result was
   produced while making this change.
+
+## GT-routed closed-loop atomic-skill success metrics (2026-08-18)
+
+Results inspected: none. No metric, dataset, seed, rollout budget, or evaluation criterion was changed.
+
+### Changed files
+
+- `src/lerobot/envs/libero.py`
+  - Added privileged atomic-attempt snapshots with stable `skill + target/goal` identities.
+  - Completion uses grasp state for `pick`, LIBERO `on`/`in` predicates for `place`/`push`, articulated-region
+    state for required intermediate `open`, and goal predicates for direct `open`/`close`/`turn`.
+  - Preserved `atomic_oracle_skill()` as the existing routing API over the new snapshot.
+- `src/lerobot/scripts/lerobot_eval.py`
+  - Under the existing `atomic_gt_routing` flag only, records one event per contiguous attempt activation,
+    closes superseded active attempts as failures unless their simulator condition completed, and persists
+    per-episode events.
+  - Adds count-based `attempts`, `successes`, and `success_rate` under each task, task group, and overall
+    `per_skill` entry in `eval_info.json`; existing task metrics and planner timelines remain unchanged.
+  - Logs one compact overall skill table at evaluation end.
+- `tests/scripts/test_lerobot_eval_atomic_failure.py`
+  - Added focused coverage for concrete-condition completion, frame de-duplication, `place -> pick` failure,
+    `pick -> place` success, and task-group/overall count aggregation.
+
+`experiments/atomic/eval_gt_routed_action_loss.py` was not edited.
+
+### Configuration
+
+- Reused `EvalPipelineConfig.atomic_gt_routing`; no new flag or dependency was added.
+- Metric fields are absent when GT routing is disabled.
+
+### Commands and exact results
+
+```bash
+uv run ruff check src/lerobot/envs/libero.py src/lerobot/scripts/lerobot_eval.py \
+  tests/scripts/test_lerobot_eval_atomic_failure.py
+# All checks passed!
+
+uv run pytest tests/scripts/test_lerobot_eval_atomic_failure.py -vv --tb=short
+# 0 tests collected: tests/conftest.py could not import torch because libcublasLt.so.12 was unavailable.
+```
+
+The targeted pytest process was stopped after the environment import failure; no broad tests were run.
+
+### Assumptions and deviations
+
+- A new attempt starts only when its stable identity becomes active before an action; a post-terminal skill is
+  not counted if no action ran under it. Re-entering the same identity after another active skill is a new attempt.
+- Per-skill group/overall rates are micro-aggregated from event counts, not inferred from timeline transitions.
+- This is a privileged-state GT-routing diagnostic, not AtomicVLA's learned think/act method and not a new
+  preregistered primary or secondary outcome. No experimental result is interpreted here.

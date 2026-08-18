@@ -284,49 +284,103 @@ class LiberoEnv(gym.Env):
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
-    def atomic_oracle_skill(self) -> str:
-        """Return the current atomic skill from privileged LIBERO state."""
+    def atomic_oracle_attempt(self) -> dict[str, Any]:
+        """Return the active atomic attempt and concrete simulator-state conditions."""
         self._ensure_env()
         assert self._env is not None
         inner = self._env.env
         goals = inner.parsed_problem["goal_state"]
         unsatisfied = [state for state in goals if not inner._eval_predicate(state)]
 
-        def closed_articulated_region(name: str) -> bool:
+        def articulated_region(name: str) -> bool:
             site = inner.object_sites_dict.get(name)
             state = inner.object_states_dict.get(name)
-            return bool(site is not None and getattr(site, "joints", ()) and not state.is_open())
+            return bool(site is not None and state is not None and getattr(site, "joints", ()))
 
         def object_is_held(name: str) -> bool:
             return bool(inner._check_grasp(inner.robots[0].gripper, inner.get_object(name)))
 
+        def attempt(skill: str, target: str, goal: Sequence[str] | None = None) -> dict[str, Any]:
+            identity = "|".join((skill, target, *(goal or ())))
+            return {"attempt_id": identity, "skill": skill, "target": target, "goal": list(goal or ())}
+
+        conditions: dict[str, bool] = {}
+
+        def add(candidate: dict[str, Any], satisfied: bool) -> dict[str, Any]:
+            conditions[candidate["attempt_id"]] = bool(satisfied)
+            return candidate
+
+        initial_containers: dict[str, list[str]] = defaultdict(list)
+        for state in inner.parsed_problem["initial_state"]:
+            if len(state) == 3 and state[0].lower() == "in" and articulated_region(state[2]):
+                initial_containers[state[1]].append(state[2])
+
+        push_task = self.task_description.lower().startswith("push ")
+        candidates: dict[tuple[str, ...], dict[str, Any]] = {}
+        for state in goals:
+            goal = tuple(state)
+            predicate = state[0].lower()
+            if predicate in {"open", "close"}:
+                candidates[goal] = add(attempt(predicate, state[1], goal), inner._eval_predicate(state))
+            elif predicate in {"turnon", "turnoff"}:
+                candidates[goal] = add(attempt("turn", state[1], goal), inner._eval_predicate(state))
+            elif predicate in {"on", "in"}:
+                object_name = state[1]
+                skill = "push" if push_task else "place"
+                candidates[goal] = add(
+                    attempt(skill, f"{object_name}->{state[2]}", goal), inner._eval_predicate(state)
+                )
+                if not push_task:
+                    add(attempt("pick", object_name), object_is_held(object_name))
+                regions = ([state[2]] if predicate == "in" and articulated_region(state[2]) else []) + (
+                    initial_containers.get(object_name, [])
+                )
+                for region in regions:
+                    add(
+                        attempt("open", region, ("access", object_name, region)),
+                        inner.object_states_dict[region].is_open(),
+                    )
+            else:
+                raise RuntimeError(f"Atomic GT routing does not support LIBERO predicate {state[0]!r}.")
+
+        current = None
         for state in unsatisfied:
             predicate = state[0].lower()
             if predicate == "close" and any(other[0].lower() != "close" for other in unsatisfied):
                 continue
             if predicate in {"open", "close"}:
-                return predicate
+                current = candidates[tuple(state)]
+                break
             if predicate in {"turnon", "turnoff"}:
-                return "turn"
-            if predicate not in {"on", "in"}:
-                raise RuntimeError(f"Atomic GT routing does not support LIBERO predicate {state[0]!r}.")
-            if self.task_description.lower().startswith("push "):
-                return "push"
+                current = candidates[tuple(state)]
+                break
+            if push_task:
+                current = candidates[tuple(state)]
+                break
 
             object_name = state[1]
-            if predicate == "in" and closed_articulated_region(state[2]):
-                return "open"
-            for initial_state in inner.parsed_problem["initial_state"]:
-                if (
-                    len(initial_state) == 3
-                    and initial_state[0].lower() == "in"
-                    and initial_state[1] == object_name
-                    and closed_articulated_region(initial_state[2])
-                ):
-                    return "open"
-            return "place" if object_is_held(object_name) else "pick"
+            regions = ([state[2]] if predicate == "in" and articulated_region(state[2]) else []) + (
+                initial_containers.get(object_name, [])
+            )
+            closed_region = next(
+                (region for region in regions if not inner.object_states_dict[region].is_open()), None
+            )
+            if closed_region is not None:
+                current = attempt("open", closed_region, ("access", object_name, closed_region))
+            elif object_is_held(object_name):
+                current = candidates[tuple(state)]
+            else:
+                current = attempt("pick", object_name)
+            break
 
-        raise RuntimeError("Atomic GT routing was requested after every LIBERO goal was satisfied.")
+        return {"attempt": current, "conditions": conditions}
+
+    def atomic_oracle_skill(self) -> str:
+        """Return the current atomic skill from privileged LIBERO state."""
+        attempt = self.atomic_oracle_attempt()["attempt"]
+        if attempt is None:
+            raise RuntimeError("Atomic GT routing was requested after every LIBERO goal was satisfied.")
+        return attempt["skill"]
 
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None, "_format_raw_obs called before _ensure_env()"

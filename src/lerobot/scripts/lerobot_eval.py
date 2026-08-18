@@ -62,7 +62,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import einops
 import gymnasium as gym
@@ -105,6 +105,55 @@ else:
 
 logger = logging.getLogger(__name__)
 ATOMIC_SKILLS = ("pick", "place", "push", "turn", "open", "close")
+
+
+def _observe_atomic_attempt(
+    active: dict[str, Any] | None,
+    events: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    step: int,
+    *,
+    start_new: bool,
+) -> dict[str, Any] | None:
+    """Close changed/completed attempts and optionally start the routed attempt."""
+    current = snapshot["attempt"]
+    conditions = snapshot["conditions"]
+    if active is not None:
+        success = bool(conditions.get(active["attempt_id"], False))
+        changed = current is None or current["attempt_id"] != active["attempt_id"]
+        if success or changed:
+            events.append(
+                {
+                    **active,
+                    "end_step": step,
+                    "success": success,
+                    "end_reason": "completed" if success else "superseded",
+                }
+            )
+            active = None
+
+    if start_new and current is not None and active is None:
+        active = {**current, "start_step": step}
+    return active
+
+
+def _finish_atomic_attempt(active: dict[str, Any] | None, events: list[dict[str, Any]], step: int) -> None:
+    if active is not None:
+        events.append({**active, "end_step": step, "success": False, "end_reason": "episode_end"})
+
+
+def _aggregate_atomic_skill_events(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    counts = {skill: {"attempts": 0, "successes": 0} for skill in ATOMIC_SKILLS}
+    for event in events:
+        counts[event["skill"]]["attempts"] += 1
+        counts[event["skill"]]["successes"] += int(event["success"])
+    return {
+        skill: {
+            **count,
+            "success_rate": count["successes"] / count["attempts"] if count["attempts"] else None,
+        }
+        for skill, count in counts.items()
+    }
 
 
 def _env_features_to_dataset_features(env_features: dict) -> dict:
@@ -265,6 +314,9 @@ def rollout(
     all_successes = []
     all_dones = []
     all_policy_failures = []
+    atomic_gt_routing = bool(getattr(policy, "atomic_gt_routing", False))
+    atomic_skill_events: list[dict[str, Any]] = []
+    active_atomic_attempt = None
 
     step = 0
     # Keep track of which environments are done.
@@ -300,8 +352,21 @@ def rollout(
             observation = preprocessor(observation)
             try:
                 with torch.inference_mode():
-                    if getattr(policy, "atomic_gt_routing", False):
-                        skill = env.call("atomic_oracle_skill")[0]
+                    if atomic_gt_routing:
+                        atomic_snapshot = env.call("atomic_oracle_attempt")[0]
+                        active_atomic_attempt = _observe_atomic_attempt(
+                            active_atomic_attempt,
+                            atomic_skill_events,
+                            atomic_snapshot,
+                            step,
+                            start_new=True,
+                        )
+                        attempt = atomic_snapshot["attempt"]
+                        if attempt is None:
+                            raise RuntimeError(
+                                "Atomic GT routing was requested after every LIBERO goal was satisfied."
+                            )
+                        skill = attempt["skill"]
                         atomic_skill_id = torch.tensor(
                             [ATOMIC_SKILLS.index(skill)], device=observation[OBS_STATE].device
                         )
@@ -336,6 +401,14 @@ def rollout(
 
             # Apply the next action.
             observation, reward, terminated, truncated, info = env.step(action_numpy)
+            if atomic_gt_routing:
+                active_atomic_attempt = _observe_atomic_attempt(
+                    active_atomic_attempt,
+                    atomic_skill_events,
+                    env.call("atomic_oracle_attempt")[0],
+                    step,
+                    start_new=False,
+                )
             if render_callback is not None:
                 render_callback(env)
 
@@ -419,6 +492,9 @@ def rollout(
                     else:
                         logging.warning("No episodes recorded for %s — skipping push to hub.", ds.repo_id)
 
+    if atomic_gt_routing:
+        _finish_atomic_attempt(active_atomic_attempt, atomic_skill_events, max(0, step - 1))
+
     # Track the final observation.
     if return_observations:
         if all_policy_failures and all_policy_failures[-1].any():
@@ -440,6 +516,8 @@ def rollout(
         for key in all_observations[0]:
             stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
+    if atomic_gt_routing:
+        ret["atomic_skill_events"] = [atomic_skill_events]
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -513,6 +591,7 @@ def eval_policy(
     all_successes = []
     all_policy_failures = []
     all_planner_histories = []
+    all_atomic_skill_events = []
     all_seeds = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
@@ -606,6 +685,7 @@ def eval_policy(
         all_policy_failures.extend(batch_policy_failures.tolist())
         planner_history = deepcopy(getattr(policy, "atomic_planner_history", []))
         all_planner_histories.extend([planner_history] * env.num_envs)
+        all_atomic_skill_events.extend(deepcopy(rollout_data.get("atomic_skill_events", [])))
         if planner_history:
             logger.info(
                 "Atomic skill timeline (episode %d): %s",
@@ -697,29 +777,34 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
-    info = {
-        "per_episode": [
-            {
-                "episode_ix": i,
-                "sum_reward": sum_reward,
-                "max_reward": max_reward,
-                "success": success,
-                "policy_failure": policy_failure,
-                "atomic_planner_history": planner_history,
-                "seed": seed,
-            }
-            for i, (sum_reward, max_reward, success, policy_failure, planner_history, seed) in enumerate(
-                zip(
-                    sum_rewards[:n_episodes],
-                    max_rewards[:n_episodes],
-                    all_successes[:n_episodes],
-                    all_policy_failures[:n_episodes],
-                    all_planner_histories[:n_episodes],
-                    all_seeds[:n_episodes],
-                    strict=True,
-                )
+    per_episode = [
+        {
+            "episode_ix": i,
+            "sum_reward": sum_reward,
+            "max_reward": max_reward,
+            "success": success,
+            "policy_failure": policy_failure,
+            "atomic_planner_history": planner_history,
+            "seed": seed,
+        }
+        for i, (sum_reward, max_reward, success, policy_failure, planner_history, seed) in enumerate(
+            zip(
+                sum_rewards[:n_episodes],
+                max_rewards[:n_episodes],
+                all_successes[:n_episodes],
+                all_policy_failures[:n_episodes],
+                all_planner_histories[:n_episodes],
+                all_seeds[:n_episodes],
+                strict=True,
             )
-        ],
+        )
+    ]
+    if getattr(policy, "atomic_gt_routing", False):
+        for episode, events in zip(per_episode, all_atomic_skill_events[:n_episodes], strict=True):
+            episode["atomic_skill_events"] = events
+
+    info = {
+        "per_episode": per_episode,
         "aggregated": {
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
@@ -877,6 +962,12 @@ def eval_main(cfg: EvalPipelineConfig):
         for task_group, task_group_info in info.items():
             logger.info(f"\nAggregated Metrics for {task_group}:")
             logger.info(task_group_info)
+        if cfg.atomic_gt_routing:
+            rows = ["skill  attempts  successes  rate"]
+            for skill, metrics in info["overall"]["per_skill"].items():
+                rate = "-" if metrics["success_rate"] is None else f"{metrics['success_rate']:.3f}"
+                rows.append(f"{skill:<6} {metrics['attempts']:>8} {metrics['successes']:>10} {rate:>5}")
+            logger.info("GT atomic skill success:\n%s", "\n".join(rows))
     # Close all vec envs
     close_envs(envs)
 
@@ -895,6 +986,8 @@ class TaskMetrics(TypedDict):
     atomic_planner_skill_timelines: list[list[str]]
     video_paths: list[str]
     predicted_video_paths: list[str]
+    atomic_skill_events: NotRequired[list[list[dict[str, Any]]]]
+    per_skill: NotRequired[dict[str, dict[str, Any]]]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths", "predicted_video_paths")
@@ -941,7 +1034,7 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
-    return TaskMetrics(
+    metrics = TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
@@ -952,6 +1045,12 @@ def eval_one(
         video_paths=task_result.get("video_paths", []),
         predicted_video_paths=task_result.get("predicted_video_paths", []),
     )
+    if getattr(policy, "atomic_gt_routing", False):
+        metrics["atomic_skill_events"] = [ep["atomic_skill_events"] for ep in per_episode]
+        metrics["per_skill"] = _aggregate_atomic_skill_events(
+            [event for episode in metrics["atomic_skill_events"] for event in episode]
+        )
+    return metrics
 
 
 def run_one(
@@ -1049,6 +1148,9 @@ def eval_policy_all(
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
+    atomic_gt_routing = bool(getattr(policy, "atomic_gt_routing", False))
+    group_atomic_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    overall_atomic_events: list[dict[str, Any]] = []
     per_task_infos: list[dict] = []
 
     # small inline helper to accumulate one task's metrics into accumulators
@@ -1074,6 +1176,10 @@ def eval_policy_all(
             if paths:
                 group_acc[group][key].extend(paths)
                 overall[key].extend(paths)
+        if atomic_gt_routing:
+            events = [event for episode in metrics["atomic_skill_events"] for event in episode]
+            group_atomic_events[group].extend(events)
+            overall_atomic_events.extend(events)
 
     # Choose runner (sequential vs threaded)
     task_runner = partial(
@@ -1155,6 +1261,8 @@ def eval_policy_all(
             "video_paths": list(acc["video_paths"]),
             "predicted_video_paths": list(acc["predicted_video_paths"]),
         }
+        if atomic_gt_routing:
+            groups_aggregated[group]["per_skill"] = _aggregate_atomic_skill_events(group_atomic_events[group])
 
     # overall aggregates
     overall_agg = {
@@ -1167,6 +1275,8 @@ def eval_policy_all(
         "video_paths": list(overall["video_paths"]),
         "predicted_video_paths": list(overall["predicted_video_paths"]),
     }
+    if atomic_gt_routing:
+        overall_agg["per_skill"] = _aggregate_atomic_skill_events(overall_atomic_events)
 
     return {
         "per_task": per_task_infos,
