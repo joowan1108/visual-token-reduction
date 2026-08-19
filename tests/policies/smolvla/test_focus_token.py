@@ -135,6 +135,27 @@ def _make_cross_attention_model():
     return model, [[vlm_layer] * 16, [expert_layer] * 16]
 
 
+def test_cross_attention_without_expert_propagates_vlm_without_cache():
+    model, layers = _make_cross_attention_model()
+    prefix = torch.randn(1, 8, 4)
+
+    outputs, cache = model.forward_cross_attn_layer(
+        layers,
+        [prefix, None],
+        1,
+        torch.arange(8).unsqueeze(0),
+        torch.ones(1, 8, 8, dtype=torch.bool),
+        1,
+        2,
+        use_cache=False,
+    )
+
+    assert outputs[0].shape == prefix.shape
+    assert torch.isfinite(outputs[0]).all()
+    assert outputs[1] is None
+    assert cache is None
+
+
 def test_focus_token_layer_boundary_dense_identity_and_direct_cached_paths():
     torch.manual_seed(0)
     model, layers = _make_cross_attention_model()
