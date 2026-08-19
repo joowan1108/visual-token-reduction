@@ -79,6 +79,16 @@ class SmolVLAConfig(PreTrainedConfig):
     atomic_subtask_to_skill: list[int] | None = None
     atomic_subtask_to_skill_path: str | None = None
 
+    # Implicit action reasoning with a FAST next-token auxiliary objective. Opt-in only.
+    implicit_fast_ki_enabled: bool = False
+    implicit_iar_layers: list[int] = field(default_factory=lambda: [-4, -3, -2, -1])
+    implicit_iar_num_queries: int = 4
+    implicit_fast_loss_weight: float = 0.1
+    implicit_transition_loss_weight: float = 0.1
+    implicit_fast_max_action_tokens: int = 256
+    implicit_fast_skip_tokens: int = 128
+    implicit_fast_action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -245,6 +255,47 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("The atomic classifier and generative planner are mutually exclusive.")
             if not self.train_expert_only or not self.freeze_vision_encoder:
                 raise ValueError("The atomic classifier requires a fully frozen action-policy backbone.")
+        if self.implicit_fast_ki_enabled:
+            if not self.atomic_sgmoe_enabled:
+                raise ValueError("Implicit FAST-KI requires `atomic_sgmoe_enabled=True`.")
+            if not self.train_expert_only or not self.freeze_vision_encoder:
+                raise ValueError("Implicit FAST-KI requires a fully frozen VLM and vision encoder.")
+            if not self.load_vlm_weights and self.pretrained_path is None:
+                raise ValueError(
+                    "Implicit FAST-KI requires `load_vlm_weights=True` or a pretrained policy checkpoint."
+                )
+            if not self.use_cache:
+                raise ValueError("Implicit FAST-KI requires VLM KV caching.")
+            if self.compile_model:
+                raise ValueError("Implicit FAST-KI currently requires `compile_model=False`.")
+            if not self.implicit_iar_layers:
+                raise ValueError("`implicit_iar_layers` must select at least one VLM layer.")
+            if any(
+                not -self.num_vlm_layers <= layer < self.num_vlm_layers for layer in self.implicit_iar_layers
+            ):
+                raise ValueError("`implicit_iar_layers` contains an out-of-range VLM layer.")
+            normalized_iar_layers = [layer % self.num_vlm_layers for layer in self.implicit_iar_layers]
+            if len(set(normalized_iar_layers)) != len(normalized_iar_layers):
+                raise ValueError("`implicit_iar_layers` must be unique after layer normalization.")
+            if self.implicit_iar_num_queries <= 0:
+                raise ValueError("`implicit_iar_num_queries` must be positive.")
+            if not math.isfinite(self.implicit_fast_loss_weight) or self.implicit_fast_loss_weight <= 0:
+                raise ValueError("`implicit_fast_loss_weight` must be positive and finite.")
+            if (
+                not math.isfinite(self.implicit_transition_loss_weight)
+                or self.implicit_transition_loss_weight <= 0
+            ):
+                raise ValueError("`implicit_transition_loss_weight` must be positive and finite.")
+            if self.implicit_fast_max_action_tokens < 2:
+                raise ValueError("`implicit_fast_max_action_tokens` must be at least 2.")
+            if self.atomic_classifier_enabled:
+                raise ValueError("Implicit FAST-KI and classifier-only training are separate experiments.")
+            if self.atomic_planner_enabled:
+                raise ValueError(
+                    "Implicit FAST-KI uses its dedicated transition head, not the atomic planner."
+                )
+            if not self.train_state_proj:
+                raise ValueError("Implicit FAST-KI requires `train_state_proj=True`.")
         if self.phase_camera_masking_enabled:
             if self.skill_linking_enabled:
                 raise ValueError("Phase-aware masking and semantic skill linking are separate experiments.")
@@ -312,6 +363,8 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def subtask_delta_indices(self) -> list[int] | None:
         if self.atomic_data_enabled:
+            if self.implicit_fast_ki_enabled:
+                return [-2 * self.n_action_steps, -self.n_action_steps, *range(self.chunk_size)]
             return ([-1] if self.atomic_classifier_enabled else []) + list(range(self.chunk_size))
         return list(range(self.n_action_steps + 1)) if self.skill_linking_enabled else None
 

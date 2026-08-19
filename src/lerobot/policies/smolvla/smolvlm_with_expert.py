@@ -268,6 +268,63 @@ class AtomicSkillFFN(nn.Module):
         return output
 
 
+class ImplicitActionReasoner(nn.Module):
+    """Project detached K/V from selected VLM layers into fixed action-context tokens."""
+
+    def __init__(
+        self,
+        layer_indices: list[int],
+        kv_size: int,
+        hidden_size: int,
+        num_queries: int,
+    ):
+        super().__init__()
+        self.layer_indices = tuple(layer_indices)
+        self.queries = nn.ParameterList(
+            nn.Parameter(torch.empty(num_queries, hidden_size)) for _ in self.layer_indices
+        )
+        self.query_projections = nn.ModuleList(
+            nn.Linear(hidden_size, hidden_size) for _ in self.layer_indices
+        )
+        self.key_projections = nn.ModuleList(nn.Linear(kv_size, hidden_size) for _ in self.layer_indices)
+        self.value_projections = nn.ModuleList(nn.Linear(kv_size, hidden_size) for _ in self.layer_indices)
+        for parameter in self.parameters():
+            if parameter.ndim > 1:
+                nn.init.normal_(parameter, std=0.02)
+            else:
+                nn.init.zeros_(parameter)
+
+    def project_layer(
+        self,
+        selected_index: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        prefix_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if key_states.shape != value_states.shape or key_states.ndim != 4:
+            raise ValueError("IAR expects matching cache K/V shaped [batch, heads, sequence, head_dim].")
+        batch_size, _, sequence_length, _ = key_states.shape
+        if prefix_mask.shape != (batch_size, sequence_length) or not prefix_mask.bool().any(dim=1).all():
+            raise ValueError("IAR prefix mask must align with K/V and retain at least one token per sample.")
+
+        projection_dtype = self.key_projections[selected_index].weight.dtype
+        keys = key_states.detach().transpose(1, 2).flatten(2).to(dtype=projection_dtype)
+        values = value_states.detach().transpose(1, 2).flatten(2).to(dtype=projection_dtype)
+        query = self.query_projections[selected_index](self.queries[selected_index])
+        keys = self.key_projections[selected_index](keys)
+        values = self.value_projections[selected_index](values)
+        scores = torch.einsum("qd,bld->bql", query, keys) / math.sqrt(query.shape[-1])
+        scores = scores.masked_fill(~prefix_mask[:, None].bool(), torch.finfo(scores.dtype).min)
+        return torch.einsum("bql,bld->bqd", scores.softmax(dim=-1), values)
+
+    def forward(self, past_key_values: "DynamicCache", prefix_mask: torch.Tensor) -> torch.Tensor:
+        contexts = []
+        for selected_index, layer_index in enumerate(self.layer_indices):
+            layer = past_key_values.layers[layer_index]
+            contexts.append(self.project_layer(selected_index, layer.keys, layer.values, prefix_mask))
+        return torch.stack(contexts).mean(dim=0)
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,

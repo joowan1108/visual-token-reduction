@@ -184,3 +184,193 @@ uv run ruff check src/lerobot/datasets/sampler.py tests/policies/smolvla/test_at
   and its equal-frequency Gate 3 assertion for SG-MoE/action training only. Skill-boundary masking remains a
   separate unchanged experiment variable.
 - No dependency repair, training, evaluation, checkpoint write, or raw-result mutation was performed.
+
+## Opt-in implicit FAST-KI context (2026-08-19)
+
+Results inspected for this intervention: none. No existing metric, dataset, seed, rollout manifest,
+statistical test, or evaluation criterion was changed.
+
+### Changed files
+
+- `src/lerobot/policies/smolvla/configuration_smolvla.py`
+  - Added disabled-by-default IAR/FAST configuration and validation for frozen VLM/cache/atomic SG-MoE use.
+  - Independent-review correction: rejects scratch random frozen teachers and selected layers that collide
+    after negative-index normalization.
+  - User-directed follow-up: requires `train_state_proj=true` for the implicit condition.
+  - Added positive `implicit_transition_loss_weight=0.1`, rejected the competing frozen atomic planner, and
+    changed implicit subtask anchors to `[-2H, -H, 0..chunk-1]`.
+- `src/lerobot/policies/smolvla/smolvlm_with_expert.py`
+  - Added independent per-selected-layer IAR queries and Q/K/V projections over detached raw cache tensors,
+    with fixed mean aggregation.
+- `src/lerobot/policies/smolvla/modeling_smolvla.py`
+  - Added the isolated gradient paths: FAST reuses frozen SmolVLM autoregression and LM head; flow receives
+    detached projected context and no raw VLM K/V or hidden memory; inference omits FAST generation.
+  - Allowed complete legacy atomic checkpoints to initialize the new IAR/token-path parameters while rejecting
+    partial implicit checkpoints.
+  - Independent-review correction: repeats the pretrained-teacher and normalized-layer checks at runtime.
+  - User-directed follow-up: excludes state from the IAR VLM prefix/cache, reuses the existing `state_proj` to
+    append one state context token to projected IAR tokens, trains the fused context with FAST, and detaches the
+    same fused context before flow and during inference.
+  - Added a dedicated six-class implicit transition head over detached fused context and two masked fixed-router
+    skill embeddings. Training CE reaches only this head; synchronous batched inference keeps and resets two
+    executed-skill history slots and routes each replanned chunk with the predicted skill.
+  - Legacy implicit checkpoints may omit the complete new transition head; partial transition-head checkpoints
+    remain invalid.
+- `src/lerobot/policies/smolvla/processor_smolvla.py`
+  - Added the opt-in SmolVLA FAST action processor, applying the canonical atomic boundary mask before
+    tokenization and reusing SmolVLM vocabulary slots.
+  - Updated implicit label slicing to preserve two history anchors while applying FAST/flow masking only to the
+    unchanged action horizon.
+- `src/lerobot/processor/tokenizer_processor.py`
+  - Extended the existing FAST tokenizer helper to accept a contiguous action padding suffix and tokenize only
+    the valid action prefix.
+- `src/lerobot/scripts/lerobot_train.py`
+  - Builds the opt-in processor from the resolved policy config when starting from the older base processor;
+    resume continues to load the checkpoint processor.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`
+  - Added one focused contract test for layer independence, shape/no-target-leakage, shared boundary masking,
+    disabled defaults, and separate FAST/flow backward gradients.
+  - Independent-review correction: the flow backward check calls production `_forward_implicit_action` and
+    verifies scratch-teacher rejection, normalized layer uniqueness, and that inference has no FAST-loss call.
+  - User-directed follow-up: production FAST/flow helpers verify FAST gradients reach IAR, `fast_context_proj`,
+    and `state_proj`, while flow gradients reach only SG-MoE; the test also checks state-free IAR prefixes/cache.
+  - Added focused transition checks for six-way output, zero-vector missing history, exactly two valid histories,
+    episode-safe anchors, batched executed-history append/reset, fixed router embeddings, and head-only CE grads.
+- `experiments/atomic/03_amendment_05_implicit_fast_ki.md`
+  - Froze configuration, data masking, objective, gradient ownership, inference behavior, and interpretation.
+
+Only the files above and this change log were normalized/edited; unrelated worktree changes were preserved.
+No dependency or vocabulary change was made.
+
+### Configuration
+
+```text
+implicit_fast_ki_enabled=false                 # default; preserves baseline
+implicit_iar_layers=[-4,-3,-2,-1]
+implicit_iar_num_queries=4
+implicit_fast_loss_weight=0.1
+implicit_transition_loss_weight=0.1
+implicit_fast_max_action_tokens=256
+implicit_fast_skip_tokens=128
+implicit_fast_action_tokenizer_name=lerobot/fast-action-tokenizer
+```
+
+Enabling the flag requires `atomic_data_enabled=true`, `atomic_sgmoe_enabled=true`,
+`train_expert_only=true`, `freeze_vision_encoder=true`, `use_cache=true`, and `compile_model=false`.
+It also requires `load_vlm_weights=true` or a policy loaded through `pretrained_path`; implicit mode forces
+`train_state_proj=true` so FAST can learn the reused proprioceptive state projection.
+The transition head is always active with implicit FAST-KI and replaces the frozen atomic planner for this
+condition.
+The existing atomic `chunk_size=10`, `n_action_steps`, mapping, and boundary contract are unchanged.
+
+### Commands and exact results
+
+```bash
+uv run ruff format src/lerobot/policies/smolvla/configuration_smolvla.py \
+  src/lerobot/policies/smolvla/smolvlm_with_expert.py \
+  src/lerobot/policies/smolvla/modeling_smolvla.py \
+  src/lerobot/policies/smolvla/processor_smolvla.py \
+  src/lerobot/processor/tokenizer_processor.py src/lerobot/scripts/lerobot_train.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# Completed; only listed modified Python files were formatted.
+
+uv run ruff check --ignore SIM102,E402 <the Python files listed above>
+# All checks passed. SIM102 and E402 are pre-existing findings in untouched code regions.
+
+/usr/bin/python3 -m py_compile <the Python files listed above>
+# Passed.
+
+uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_ffn_starts_dense_equivalent_and_only_runs_selected_experts \
+  -q --tb=short
+# Collection failed before tests ran: ImportError: libcublasLt.so.12 was unavailable.
+```
+
+The system Python has no `torch`, so no alternate runtime test was claimed. No dependency repair, training,
+evaluation, checkpoint write, or raw-result mutation was performed.
+
+Independent-review correction validation:
+
+```bash
+uv run ruff check --ignore SIM102,E402 <the modified Python files>
+# All checks passed.
+
+/usr/bin/python3 -m py_compile <the modified Python files>
+# Passed.
+
+git diff --check --ignore-space-at-eol -- <the intervention files>
+# Passed.
+
+timeout 25s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_ffn_starts_dense_equivalent_and_only_runs_selected_experts \
+  -q --tb=short
+# Timed out before pytest emitted collection output (exit 124).
+
+timeout 15s uv run python -c 'import torch; print(torch.__version__)'
+# Failed during torch import: ImportError: libcublasLt.so.12: cannot open shared object file.
+```
+
+User-directed state-fusion follow-up validation:
+
+```bash
+.venv/bin/ruff check --ignore SIM102,E402 <the modified Python files>
+# All checks passed.
+
+/usr/bin/python3 -m py_compile <the modified Python files>
+# Passed.
+
+git diff --check --ignore-space-at-eol -- <the intervention files>
+# Passed.
+
+timeout 25s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_ffn_starts_dense_equivalent_and_only_runs_selected_experts \
+  -q --tb=short
+# Collection failed before tests ran (exit 4):
+# ImportError: libcublasLt.so.12: cannot open shared object file: No such file or directory
+```
+
+Dedicated implicit transition-head validation:
+
+```bash
+.venv/bin/ruff check --ignore SIM102,E402 \
+  src/lerobot/policies/smolvla/configuration_smolvla.py \
+  src/lerobot/policies/smolvla/modeling_smolvla.py \
+  src/lerobot/policies/smolvla/processor_smolvla.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed.
+
+/usr/bin/python3 -m py_compile <the modified Python files>
+# Passed.
+
+timeout 25s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_transition_history_anchors_are_episode_safe_and_reset_per_batch \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract \
+  -q --tb=short
+# Timed out before pytest emitted collection output (exit 124).
+
+timeout 15s uv run python -c 'import torch; print(torch.__version__)'
+# Failed during torch import:
+# ImportError: libcublasLt.so.12: cannot open shared object file: No such file or directory
+```
+
+### Assumptions and deviations
+
+- FAST action tokenization is variable-horizon over the valid contiguous chunk prefix because compressed FAST
+  tokens do not retain a one-token-per-timestep mask. This preserves the frozen boundary contract without
+  leaking masked future targets.
+- The existing reverse-vocabulary mapping is applied to the SmolVLM tokenizer; no new token IDs or embedding
+  rows are created.
+- The frozen SmolVLM transformer and LM head are reused as the autoregressive token path. This is the minimal
+  KI-style reusable path and intentionally does not add or claim an exact separate decoder reproduction.
+- IAR emits four expert-width context tokens from an image-language-only cache. A single FAST-trained projection
+  maps them to SmolVLM width and concatenates the existing projected-state token; flow consumes the detached
+  fused result, so flow cannot update IAR or either projection.
+- This implementation does not authorize or add training/evaluation runs. Any future results belong to a
+  separately named opt-in condition and must not replace or be pooled with the original preregistered A/B result.

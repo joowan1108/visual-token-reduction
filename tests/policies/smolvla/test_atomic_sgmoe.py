@@ -1,6 +1,8 @@
+import inspect
 import math
 from collections import deque
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,20 +11,27 @@ from torch import nn
 
 import lerobot.policies.smolvla.smolvlm_with_expert as smolvlm_with_expert
 from lerobot.datasets.sampler import AtomicSkillSampler
+from lerobot.lerobot_types import TransitionKey
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
+    ATOMIC_SKILLS,
     AtomicPlannerEpisodeFailure,
+    ImplicitAtomicTransitionHead,
     SmolVLAPolicy,
     VLAFlowMatching,
     atomic_classifier_event_counts,
     parse_atomic_planner_output,
 )
+from lerobot.policies.smolvla.processor_smolvla import (
+    SmolVLAImplicitFastActionTokenizerProcessorStep,
+)
 from lerobot.policies.smolvla.smolvlm_with_expert import (
     AtomicSkillFFN,
     AtomicSkillRouter,
+    ImplicitActionReasoner,
     SmolVLMWithExpertModel,
 )
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_STATE
 
 
 def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
@@ -108,6 +117,270 @@ def test_atomic_ffn_starts_dense_equivalent_and_only_runs_selected_experts():
     assert router.route.weight.grad is not None
 
 
+def test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage():
+    assert SmolVLAConfig().implicit_fast_ki_enabled is False
+    implicit_config = {
+        "chunk_size": 10,
+        "n_action_steps": 5,
+        "atomic_data_enabled": True,
+        "atomic_sgmoe_enabled": True,
+        "implicit_fast_ki_enabled": True,
+        "atomic_subtask_to_skill": list(range(6)),
+    }
+    with pytest.raises(ValueError, match="pretrained policy checkpoint"):
+        SmolVLAConfig(**implicit_config)
+    with pytest.raises(ValueError, match="pretrained policy checkpoint"):
+        VLAFlowMatching(
+            SimpleNamespace(
+                implicit_fast_ki_enabled=True,
+                load_vlm_weights=False,
+                pretrained_path=None,
+            )
+        )
+    with pytest.raises(ValueError, match="unique after layer normalization"):
+        SmolVLAConfig(
+            **implicit_config,
+            pretrained_path=Path("local-checkpoint"),
+            implicit_iar_layers=[-1, 15],
+        )
+    with pytest.raises(ValueError, match="train_state_proj=True"):
+        SmolVLAConfig(
+            **implicit_config,
+            pretrained_path=Path("local-checkpoint"),
+            train_state_proj=False,
+        )
+    config = SmolVLAConfig(
+        **implicit_config,
+        pretrained_path=Path("local-checkpoint"),
+    )
+    assert config.implicit_iar_layers == [-4, -3, -2, -1]
+    assert config.train_state_proj is True
+    reasoner = ImplicitActionReasoner([0, 1], kv_size=6, hidden_size=4, num_queries=3)
+    assert reasoner.queries[0] is not reasoner.queries[1]
+    assert reasoner.query_projections[0] is not reasoner.query_projections[1]
+    assert reasoner.key_projections[0] is not reasoner.key_projections[1]
+    assert reasoner.value_projections[0] is not reasoner.value_projections[1]
+
+    vlm_weight = nn.Parameter(torch.tensor(1.0))
+    layers = []
+    for _ in range(2):
+        layers.append(
+            SimpleNamespace(
+                keys=vlm_weight * torch.randn(2, 2, 5, 3),
+                values=vlm_weight * torch.randn(2, 2, 5, 3),
+            )
+        )
+    cache = SimpleNamespace(layers=layers)
+    prefix_mask = torch.tensor([[True, True, True, False, False], [True] * 5])
+
+    layer_one_before = reasoner.project_layer(1, layers[1].keys, layers[1].values, prefix_mask)
+    with torch.no_grad():
+        reasoner.key_projections[0].weight.add_(1)
+    layer_one_after = reasoner.project_layer(1, layers[1].keys, layers[1].values, prefix_mask)
+    torch.testing.assert_close(layer_one_before, layer_one_after)
+
+    context = reasoner(cache, prefix_mask)
+    assert context.shape == (2, 3, 4)
+    action_targets = torch.randn(2, 10, 7)
+    unchanged_context = reasoner(cache, prefix_mask)
+    action_targets.add_(1000)
+    torch.testing.assert_close(reasoner(cache, prefix_mask), unchanged_context)
+
+    tokenizer = SmolVLAImplicitFastActionTokenizerProcessorStep.__new__(
+        SmolVLAImplicitFastActionTokenizerProcessorStep
+    )
+    tokenizer.atomic_subtask_to_skill = [0, 1]
+    captured_masks = []
+
+    def tokenize(actions, action_is_pad):
+        captured_masks.append(action_is_pad.clone())
+        return torch.ones(1, 3, dtype=torch.long), torch.ones(1, 3, dtype=torch.bool)
+
+    tokenizer._tokenize_action = tokenize
+    tokenized = tokenizer(
+        {
+            TransitionKey.OBSERVATION: {},
+            TransitionKey.ACTION: torch.zeros(1, 4, 2),
+            TransitionKey.REWARD: None,
+            TransitionKey.DONE: None,
+            TransitionKey.TRUNCATED: None,
+            TransitionKey.INFO: None,
+            TransitionKey.COMPLEMENTARY_DATA: {
+                "subtask_index": torch.tensor([[0, 0, 0, 0, 1, 1]]),
+                "subtask_index_is_pad": torch.tensor([[True, True, False, False, False, False]]),
+                "action_is_pad": torch.tensor([[False, False, False, True]]),
+            },
+        }
+    )
+    assert captured_masks[0].tolist() == [[False, False, True, True]]
+    assert tokenized[TransitionKey.COMPLEMENTARY_DATA]["action_is_pad"].tolist() == [
+        [False, False, True, True]
+    ]
+    assert ACTION_TOKENS in tokenized[TransitionKey.COMPLEMENTARY_DATA]
+    assert ACTION_TOKEN_MASK in tokenized[TransitionKey.COMPLEMENTARY_DATA]
+
+    class TinyVLMWithExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(16, 4)
+            self.lm_head = nn.Linear(4, 16)
+            self.vlm = SimpleNamespace(lm_head=self.lm_head)
+            self.sgmoe = AtomicSkillFFN(nn.Sequential(nn.Linear(4, 8), nn.SiLU(), nn.Linear(8, 4)))
+            self.atomic_router = AtomicSkillRouter(6)
+            self.embedding.requires_grad_(False)
+            self.lm_head.requires_grad_(False)
+
+        def embed_image(self, image):
+            return image
+
+        def embed_language_tokens(self, tokens):
+            return self.embedding(tokens)
+
+        def get_vlm_model(self):
+            return SimpleNamespace(text_model=SimpleNamespace(get_input_embeddings=lambda: self.embedding))
+
+        def forward(self, inputs_embeds, atomic_skill_id=None, **kwargs):
+            implicit, suffix = inputs_embeds
+            if suffix is None:
+                return [implicit + implicit.mean(dim=1, keepdim=True), None], None
+            route = (atomic_skill_id, torch.full_like(atomic_skill_id, 0.5, dtype=suffix.dtype))
+            mixed = suffix + implicit.mean(dim=1, keepdim=True)
+            return [implicit, self.sgmoe(mixed, route)], None
+
+    flow_model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(flow_model)
+    flow_model.config = SimpleNamespace(
+        implicit_fast_ki_enabled=True,
+        train_state_proj=True,
+        atomic_classifier_enabled=False,
+        chunk_size=5,
+    )
+    flow_model.state_proj = nn.Linear(4, 4)
+    flow_model.fast_context_proj = nn.Linear(4, 4)
+    flow_model.implicit_transition_head = ImplicitAtomicTransitionHead(4, 6)
+    flow_model.vlm_with_expert = TinyVLMWithExpert()
+    flow_model.implicit_action_reasoner = reasoner
+    flow_model.add_image_special_tokens = False
+    flow_model.prefix_length = -1
+    flow_model.set_requires_grad()
+    assert all(parameter.requires_grad for parameter in flow_model.state_proj.parameters())
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = config
+    policy.model = flow_model
+    optim_param_ids = {id(parameter) for parameter in policy.get_optim_params()}
+    assert all(id(parameter) in optim_param_ids for parameter in flow_model.state_proj.parameters())
+
+    images = [torch.randn(2, 2, 4)]
+    image_masks = [torch.ones(2, dtype=torch.bool)]
+    language_tokens = torch.tensor([[1, 2], [3, 4]])
+    language_masks = torch.ones(2, 2, dtype=torch.bool)
+    prefix_without_state = flow_model.embed_prefix(
+        images, image_masks, language_tokens, language_masks, state=None
+    )[0]
+    changed_state = torch.randn(2, 4)
+    iar_before_state_change = flow_model._implicit_context(cache, prefix_mask)
+    changed_state.add_(1000)
+    torch.testing.assert_close(flow_model._implicit_context(cache, prefix_mask), iar_before_state_change)
+    torch.testing.assert_close(
+        flow_model.embed_prefix(images, image_masks, language_tokens, language_masks, state=None)[0],
+        prefix_without_state,
+    )
+    assert (
+        flow_model.embed_prefix(images, image_masks, language_tokens, language_masks, state=changed_state)[
+            0
+        ].shape[1]
+        == prefix_without_state.shape[1] + 1
+    )
+    assert "state=None if self._implicit_fast_ki_enabled() else state" in inspect.getsource(
+        VLAFlowMatching.forward
+    )
+    assert "state=None if self._implicit_fast_ki_enabled() else state" in inspect.getsource(
+        VLAFlowMatching.sample_actions
+    )
+
+    state = torch.randn(2, 4)
+    fused_context = flow_model._fused_implicit_context(context, state)
+    assert fused_context.shape == (2, 4, 4)
+    fast_tokens = torch.tensor([[1, 2, 3], [2, 3, 4]])
+    fast_masks = torch.ones_like(fast_tokens, dtype=torch.bool)
+    flow_model._fast_losses(fused_context, fast_tokens, fast_masks).mean().backward()
+    assert any(parameter.grad is not None for parameter in reasoner.parameters())
+    assert any(parameter.grad is not None for parameter in flow_model.fast_context_proj.parameters())
+    assert any(parameter.grad is not None for parameter in flow_model.state_proj.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.vlm_with_expert.sgmoe.parameters())
+    assert flow_model.vlm_with_expert.embedding.weight.grad is None
+    assert flow_model.vlm_with_expert.lm_head.weight.grad is None
+    assert vlm_weight.grad is None
+
+    for module in (
+        reasoner,
+        flow_model.fast_context_proj,
+        flow_model.state_proj,
+        flow_model.vlm_with_expert.sgmoe,
+    ):
+        for parameter in module.parameters():
+            parameter.grad = None
+
+    route = (torch.tensor([0, 1]), torch.tensor([0.5, 0.5]))
+    suffix = torch.randn(2, 5, 4)
+    flow_context = reasoner(cache, prefix_mask)
+    fused_context = flow_model._fused_implicit_context(flow_context, state)
+    flow_model._forward_implicit_action(
+        fused_context,
+        suffix,
+        torch.ones(2, 5, dtype=torch.bool),
+        torch.ones(2, 5, dtype=torch.bool),
+        route[0],
+    ).square().mean().backward()
+    assert any(parameter.grad is not None for parameter in flow_model.vlm_with_expert.sgmoe.parameters())
+    assert all(parameter.grad is None for parameter in reasoner.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.fast_context_proj.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.state_proj.parameters())
+    assert flow_model.vlm_with_expert.embedding.weight.grad is None
+    assert "_fast_losses" not in inspect.getsource(VLAFlowMatching.sample_actions)
+    assert vlm_weight.grad is None
+
+    for module in (
+        reasoner,
+        flow_model.fast_context_proj,
+        flow_model.state_proj,
+        flow_model.vlm_with_expert.sgmoe,
+        flow_model.implicit_transition_head,
+    ):
+        for parameter in module.parameters():
+            parameter.grad = None
+    transition_context = flow_model._fused_implicit_context(reasoner(cache, prefix_mask), state)
+    no_history = torch.zeros(2, 2, dtype=torch.bool)
+    no_history_logits = flow_model._implicit_transition_logits(
+        transition_context, torch.tensor([[0, 1], [2, 3]]), no_history
+    )
+    torch.testing.assert_close(
+        no_history_logits,
+        flow_model._implicit_transition_logits(
+            transition_context, torch.tensor([[5, 4], [1, 0]]), no_history
+        ),
+    )
+    assert no_history_logits.shape == (2, len(ATOMIC_SKILLS))
+    with pytest.raises(ValueError, match=r"\[batch, 2\]"):
+        flow_model._implicit_transition_logits(
+            transition_context,
+            torch.zeros(2, 3, dtype=torch.long),
+            torch.zeros(2, 3, dtype=torch.bool),
+        )
+    history_ids = torch.tensor([[0, 1], [2, 3]])
+    history_valid = torch.ones(2, 2, dtype=torch.bool)
+    transition_logits = flow_model._implicit_transition_logits(transition_context, history_ids, history_valid)
+    torch.nn.functional.cross_entropy(transition_logits, torch.tensor([1, 4])).backward()
+    assert any(parameter.grad is not None for parameter in flow_model.implicit_transition_head.parameters())
+    assert all(parameter.grad is None for parameter in reasoner.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.fast_context_proj.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.state_proj.parameters())
+    assert all(parameter.grad is None for parameter in flow_model.vlm_with_expert.sgmoe.parameters())
+    assert flow_model.vlm_with_expert.atomic_router.skill_embeddings.requires_grad is False
+    assert flow_model.vlm_with_expert.atomic_router.route.weight.grad is None
+
+
 def test_atomic_boundary_mask_uses_canonical_skill_not_subtask_identity():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     policy.config = SimpleNamespace(chunk_size=4, atomic_subtask_to_skill=[0, 1, 1, 2, 3, 4, 5])
@@ -119,6 +392,77 @@ def test_atomic_boundary_mask_uses_canonical_skill_not_subtask_identity():
     )
     assert skill.tolist() == [1]
     assert action_is_pad.tolist() == [[False, False, True, True]]
+
+
+def test_implicit_transition_history_anchors_are_episode_safe_and_reset_per_batch():
+    config = SmolVLAConfig(
+        chunk_size=10,
+        n_action_steps=5,
+        atomic_data_enabled=True,
+        atomic_sgmoe_enabled=True,
+        implicit_fast_ki_enabled=True,
+        atomic_subtask_to_skill=list(range(6)),
+        pretrained_path=Path("local-checkpoint"),
+    )
+    assert config.subtask_delta_indices == [-10, -5, *range(10)]
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = config
+    labels = torch.tensor(
+        [
+            [0, 1, *([2] * 10)],
+            [0, 1, *([2] * 10)],
+            [3, 4, *([5] * 10)],
+        ]
+    )
+    padding = torch.zeros_like(labels, dtype=torch.bool)
+    padding[0, :2] = True
+    padding[1, 0] = True
+    target, history_ids, history_valid = policy._implicit_transition_targets(
+        {"subtask_index": labels, "subtask_index_is_pad": padding}
+    )
+    assert target.tolist() == [2, 2, 5]
+    assert history_ids.tolist() == [[0, 1], [0, 1], [3, 4]]
+    assert history_valid.tolist() == [[False, False], [False, True], [True, True]]
+
+    policy.config = SimpleNamespace(
+        n_action_steps=1,
+        implicit_fast_ki_enabled=True,
+        action_feature=SimpleNamespace(shape=(1,)),
+        adapt_to_pi_aloha=False,
+    )
+    policy.reset()
+    policy._ensure_implicit_transition_history(2, torch.device("cpu"))
+    assert not policy._implicit_transition_history_valid.any()
+    selected_logits = torch.zeros(2, len(ATOMIC_SKILLS))
+    selected_logits[0, 2] = 1
+    selected_logits[1, 4] = 1
+    policy.model = SimpleNamespace(
+        sample_actions=lambda *args, **kwargs: (torch.zeros(2, 1, 1), selected_logits)
+    )
+    policy.prepare_images = lambda batch, current_phase=None: ([], [])
+    policy.prepare_state = lambda batch: batch[OBS_STATE]
+    policy._get_action_chunk(
+        {
+            OBS_STATE: torch.zeros(2, 1),
+            "observation.language.tokens": torch.zeros(2, 1, dtype=torch.long),
+            "observation.language.attention_mask": torch.ones(2, 1, dtype=torch.bool),
+        },
+        transition_history_ids=policy._implicit_transition_history_ids,
+        transition_history_valid=policy._implicit_transition_history_valid,
+    )
+    assert policy._implicit_transition_history_ids.tolist() == [[0, 2], [0, 4]]
+    assert policy._implicit_transition_history_valid.tolist() == [[False, True], [False, True]]
+    policy.reset()
+    policy._ensure_implicit_transition_history(2, torch.device("cpu"))
+    policy._append_implicit_transition_history(torch.tensor([1, 2]))
+    policy._append_implicit_transition_history(torch.tensor([3, 4]))
+    policy._append_implicit_transition_history(torch.tensor([5, 0]))
+    assert policy._implicit_transition_history_ids.tolist() == [[3, 5], [4, 0]]
+    assert policy._implicit_transition_history_valid.tolist() == [[True, True], [True, True]]
+    policy.reset()
+    assert policy._implicit_transition_history_ids is None
+    assert policy._implicit_transition_history_valid is None
 
 
 def test_atomic_classifier_uses_previous_and_current_frame_labels():

@@ -446,6 +446,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator.wait_for_everyone()
 
     processor_pretrained_path = active_cfg.pretrained_path
+    if (
+        getattr(active_cfg, "implicit_fast_ki_enabled", False)
+        and processor_pretrained_path
+        and not cfg.resume
+    ):
+        # The base SmolVLA processor predates FAST action targets; build the opt-in processor from config.
+        processor_pretrained_path = None
 
     processor_kwargs = {}
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:

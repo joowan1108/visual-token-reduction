@@ -430,7 +430,9 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         """
         return self._paligemma_tokenizer.vocab_size - 1 - self.fast_skip_tokens - tokens
 
-    def _tokenize_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tokenize_action(
+        self, action: torch.Tensor, action_is_pad: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Tokenizes the action tensor and creates a mask.
 
@@ -454,6 +456,14 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
             action = action.unsqueeze(0)
 
         batch_size = action.shape[0]
+        if action_is_pad is not None:
+            action_is_pad = action_is_pad.bool()
+            if action_is_pad.shape != action.shape[:2]:
+                raise ValueError("`action_is_pad` must match the action batch and horizon.")
+            if ((~action_is_pad[:, 1:]) & action_is_pad[:, :-1]).any():
+                raise ValueError("FAST action padding must be a contiguous suffix.")
+            if action_is_pad.all(dim=1).any():
+                raise ValueError("FAST action tokenization requires at least one valid action step.")
 
         # Tokenize the action batch
         # The fast tokenizer expects action data and returns token IDs
@@ -462,7 +472,10 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
 
         for i in range(batch_size):
             # Tokenize single action (move to CPU first as tokenizer uses scipy which requires numpy)
-            action_cpu = action[i : i + 1].cpu()
+            valid_length = action.shape[1]
+            if action_is_pad is not None:
+                valid_length = int((~action_is_pad[i]).sum().item())
+            action_cpu = action[i : i + 1, :valid_length].cpu()
             tokens = self.action_tokenizer(action_cpu)
 
             # Convert to numpy array if it's a list

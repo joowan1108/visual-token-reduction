@@ -62,7 +62,14 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    ACTION_TOKEN_MASK,
+    ACTION_TOKENS,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.import_utils import require_package
 
@@ -77,7 +84,7 @@ from ..pretrained import PreTrainedPolicy, RolloutEpisodeFailure
 from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import populate_queues
 from .configuration_smolvla import SmolVLAConfig
-from .smolvlm_with_expert import SmolVLMWithExpertModel
+from .smolvlm_with_expert import ImplicitActionReasoner, SmolVLMWithExpertModel
 
 ATOMIC_SKILLS = ("pick", "place", "push", "turn", "open", "close")
 logger = logging.getLogger(__name__)
@@ -227,6 +234,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._atomic_planner_skill = None
         self._atomic_planner_consecutive_failures = 0
         self.atomic_planner_history = []
+        self._implicit_transition_history_ids = None
+        self._implicit_transition_history_valid = None
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -245,6 +254,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 model_value.rtc_processor = self.rtc_processor
 
     def get_optim_params(self) -> dict:
+        if self.config.implicit_fast_ki_enabled:
+            return (parameter for parameter in self.parameters() if parameter.requires_grad)
         return self.parameters()
 
     def _get_action_chunk(
@@ -275,7 +286,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             task_descriptions=batch.get("task"),
             **kwargs,
         )
-        if self._skill_linking_enabled():
+        if self._implicit_transition_enabled():
+            actions, transition_logits = actions
+            selected_skill = transition_logits.argmax(dim=-1)
+            self._append_implicit_transition_history(selected_skill)
+            self._last_transition_prediction = selected_skill.clone()
+        elif self._skill_linking_enabled():
             actions, transition_logits = actions
             transition_logits = transition_logits.clone()
             transition_logits[:, 0] = torch.finfo(transition_logits.dtype).min
@@ -310,6 +326,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             or self._phase_masking_enabled()
             or self._atomic_planner_enabled()
             or self._atomic_classifier_enabled()
+            or self._implicit_transition_enabled()
         ):
             raise RuntimeError(
                 "Stateful skill/phase/planner prediction supports synchronous select_action only."
@@ -343,7 +360,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if self._check_get_actions_condition():
             atomic_skill_id = kwargs.get("atomic_skill_id")
-            if self._atomic_planner_enabled() or self._atomic_classifier_enabled():
+            transition_history_ids = None
+            transition_history_valid = None
+            if self._implicit_transition_enabled():
+                if atomic_skill_id is not None:
+                    raise ValueError(
+                        "Do not manually pass `atomic_skill_id` while implicit transition planning is enabled."
+                    )
+                self._ensure_implicit_transition_history(batch[OBS_STATE].shape[0], batch[OBS_STATE].device)
+                transition_history_ids = self._implicit_transition_history_ids
+                transition_history_valid = self._implicit_transition_history_valid
+            elif self._atomic_planner_enabled() or self._atomic_classifier_enabled():
                 if atomic_skill_id is not None:
                     raise ValueError(
                         "Do not manually pass `atomic_skill_id` while atomic skill prediction is enabled."
@@ -384,6 +411,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 current_skill=current_skill,
                 current_phase=current_phase,
                 atomic_skill_id=atomic_skill_id,
+                transition_history_ids=transition_history_ids,
+                transition_history_valid=transition_history_valid,
             )
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
@@ -409,6 +438,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _atomic_classifier_enabled(self) -> bool:
         return getattr(self.config, "atomic_classifier_enabled", False)
+
+    def _implicit_transition_enabled(self) -> bool:
+        return getattr(self.config, "implicit_fast_ki_enabled", False)
+
+    def _ensure_implicit_transition_history(self, batch_size: int, device: torch.device) -> None:
+        history = self._implicit_transition_history_ids
+        if torch.is_tensor(history) and history.shape == (batch_size, 2) and history.device == device:
+            return
+        self._implicit_transition_history_ids = torch.zeros(batch_size, 2, dtype=torch.long, device=device)
+        self._implicit_transition_history_valid = torch.zeros(batch_size, 2, dtype=torch.bool, device=device)
+
+    def _append_implicit_transition_history(self, selected_skill: Tensor) -> None:
+        if self._implicit_transition_history_ids is None or self._implicit_transition_history_valid is None:
+            raise RuntimeError("Implicit transition history must be initialized before replanning.")
+        if selected_skill.shape != self._implicit_transition_history_ids.shape[:1]:
+            raise ValueError("Selected implicit skills must align with the rollout batch.")
+        self._implicit_transition_history_ids = torch.cat(
+            [self._implicit_transition_history_ids[:, 1:], selected_skill[:, None]], dim=1
+        )
+        self._implicit_transition_history_valid = torch.cat(
+            [
+                self._implicit_transition_history_valid[:, 1:],
+                torch.ones_like(selected_skill[:, None], dtype=torch.bool),
+            ],
+            dim=1,
+        )
 
     def replan_atomic_skill_classifier(self, batch: dict[str, Tensor]) -> Tensor:
         if batch[OBS_STATE].shape[0] != 1:
@@ -524,7 +579,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise KeyError("Atomic data handling requires `subtask_index` and `subtask_index_is_pad`.")
         if labels.ndim != 2 or labels.shape != labels_is_pad.shape:
             raise ValueError("Atomic subtask labels and padding mask must be aligned rank-2 tensors.")
-        anchor = 1 if self._atomic_classifier_enabled() else 0
+        anchor = 2 if self._implicit_transition_enabled() else (1 if self._atomic_classifier_enabled() else 0)
         if labels.shape[1] != self.config.chunk_size + anchor or labels_is_pad[:, anchor].any():
             raise ValueError("Atomic subtask windows must cover the chunk and have an unpadded anchor.")
 
@@ -549,6 +604,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         has_previous = ~labels_is_pad[:, 0]
         previous_skill[has_previous] = mapping[labels[has_previous, 0].long()]
         return current_skill, previous_skill
+
+    def _implicit_transition_targets(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        target, _ = self._atomic_batch_contract(batch)
+        labels = batch["subtask_index"][:, :2].long()
+        history_valid = ~batch["subtask_index_is_pad"][:, :2].bool()
+        mapping = torch.tensor(self.config.atomic_subtask_to_skill, device=labels.device)
+        history_ids = mapping[labels.clamp(0, mapping.numel() - 1)]
+        return target, history_ids, history_valid
 
     def _ensure_phase_state(self, batch_size: int, device: torch.device) -> None:
         if torch.is_tensor(self._current_phase):
@@ -705,6 +768,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 raise ValueError("Partial atomic classifier checkpoint is not allowed.")
             if not present_classifier_keys:
                 allowed_missing |= classifier_keys
+            implicit_keys = {
+                key
+                for key in current
+                if key.startswith("model.implicit_action_reasoner.")
+                or key.startswith("model.fast_context_proj.")
+            }
+            present_implicit_keys = implicit_keys & set(checkpoint)
+            if present_implicit_keys and present_implicit_keys != implicit_keys:
+                raise ValueError("Partial implicit FAST-KI checkpoint is not allowed.")
+            if not present_implicit_keys:
+                allowed_missing |= implicit_keys
+            transition_keys = {key for key in current if key.startswith("model.implicit_transition_head.")}
+            present_transition_keys = transition_keys & set(checkpoint)
+            if present_transition_keys and present_transition_keys != transition_keys:
+                raise ValueError("Partial implicit transition-head checkpoint is not allowed.")
+            if not present_transition_keys:
+                allowed_missing |= transition_keys
             incompatible = model.load_state_dict(checkpoint, strict=False)
             if set(incompatible.missing_keys) - allowed_missing:
                 raise ValueError(f"Missing non-router keys in Atomic checkpoint: {incompatible.missing_keys}")
@@ -804,11 +884,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         atomic_skill_id = None
+        implicit_transition_target = None
+        transition_history_ids = None
+        transition_history_valid = None
         if self.config.atomic_data_enabled:
             atomic_skill_id, boundary_is_pad = self._atomic_batch_contract(batch)
             actions_is_pad = (
                 boundary_is_pad if actions_is_pad is None else actions_is_pad.bool() | boundary_is_pad
             )
+            if self._implicit_transition_enabled():
+                (
+                    implicit_transition_target,
+                    transition_history_ids,
+                    transition_history_valid,
+                ) = self._implicit_transition_targets(batch)
         loss_dict = {}
         model_output = self.model.forward(
             images,
@@ -822,9 +911,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             current_skill=current_skill,
             current_phase=current_phase,
             atomic_skill_id=atomic_skill_id,
+            fast_action_tokens=batch.get(ACTION_TOKENS),
+            fast_action_masks=batch.get(ACTION_TOKEN_MASK),
+            transition_history_ids=transition_history_ids,
+            transition_history_valid=transition_history_valid,
         )
         auxiliary_logits = None
-        if auxiliary_name is not None:
+        fast_losses = None
+        implicit_transition_logits = None
+        if self.config.implicit_fast_ki_enabled:
+            losses, fast_losses, implicit_transition_logits = model_output
+        elif auxiliary_name is not None:
             losses, auxiliary_logits = model_output
             if auxiliary_name == "transition":
                 auxiliary_logits = auxiliary_logits.clone()
@@ -844,6 +941,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        implicit_transition_losses = None
+        if implicit_transition_logits is not None:
+            implicit_transition_losses = F.cross_entropy(
+                implicit_transition_logits, implicit_transition_target, reduction="none"
+            )
+            prediction = implicit_transition_logits.argmax(dim=-1)
+            previous_skill = torch.where(
+                transition_history_valid[:, -1],
+                transition_history_ids[:, -1],
+                torch.full_like(transition_history_ids[:, -1], len(ATOMIC_SKILLS)),
+            )
+            loss_dict["implicit_transition_loss"] = implicit_transition_losses.mean().item()
+            loss_dict["implicit_transition_accuracy"] = (
+                (prediction == implicit_transition_target).float().mean().item()
+            )
+            loss_dict.update(
+                atomic_classifier_event_counts(prediction, implicit_transition_target, previous_skill)
+            )
+
         if auxiliary_name is None:
             if reduction == "none":
                 # Return per-sample losses (B,) by averaging over valid (time, action) entries
@@ -852,6 +968,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 else:
                     num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                     per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+                if fast_losses is not None:
+                    loss_dict["flow_loss"] = per_sample_loss.mean().item()
+                    loss_dict["fast_loss"] = fast_losses.mean().item()
+                    per_sample_loss = per_sample_loss + self.config.implicit_fast_loss_weight * fast_losses
+                if implicit_transition_losses is not None:
+                    per_sample_loss = (
+                        per_sample_loss
+                        + self.config.implicit_transition_loss_weight * implicit_transition_losses
+                    )
                 loss_dict["loss"] = per_sample_loss.mean().item()
                 return per_sample_loss, loss_dict
             else:
@@ -861,6 +986,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 else:
                     num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                     loss = losses.sum() / num_valid
+                if fast_losses is not None:
+                    fast_loss = fast_losses.mean()
+                    loss_dict["flow_loss"] = loss.item()
+                    loss_dict["fast_loss"] = fast_loss.item()
+                    loss = loss + self.config.implicit_fast_loss_weight * fast_loss
+                if implicit_transition_losses is not None:
+                    loss = loss + self.config.implicit_transition_loss_weight * (
+                        implicit_transition_losses.mean()
+                    )
                 loss_dict["loss"] = loss.item()
                 return loss, loss_dict
 
@@ -1137,6 +1271,36 @@ class AtomicSkillClassifier(nn.Module):
         ).float()
 
 
+class ImplicitAtomicTransitionHead(nn.Module):
+    """Predict the next executed atomic skill from detached context and fixed skill history."""
+
+    def __init__(self, context_dim: int, hidden_dim: int):
+        super().__init__()
+        self.context_proj = nn.Linear(context_dim, hidden_dim)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(ATOMIC_SKILLS)),
+        )
+
+    def forward(
+        self,
+        fused_context: Tensor,
+        history_embeddings: Tensor,
+        history_valid: Tensor,
+    ) -> Tensor:
+        if history_embeddings.shape[:2] != (fused_context.shape[0], 2):
+            raise ValueError("Implicit transition history must contain exactly two skill slots.")
+        if history_valid.shape != history_embeddings.shape[:2]:
+            raise ValueError("Implicit transition history masks must align with the two skill slots.")
+        dtype = self.context_proj.weight.dtype
+        context = self.context_proj(fused_context.detach().to(dtype=dtype)).mean(dim=1)
+        history = history_embeddings.detach().to(dtype=dtype)
+        history = history * history_valid.to(dtype=dtype)[..., None]
+        return self.classifier(torch.cat([context, history.flatten(1)], dim=-1)).float()
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -1166,6 +1330,14 @@ class VLAFlowMatching(nn.Module):
     def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
+        if (
+            self._implicit_fast_ki_enabled()
+            and not config.load_vlm_weights
+            and config.pretrained_path is None
+        ):
+            raise ValueError(
+                "Implicit FAST-KI requires `load_vlm_weights=True` or a pretrained policy checkpoint."
+            )
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -1201,6 +1373,35 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.implicit_action_reasoner = None
+        self.fast_context_proj = None
+        self.implicit_transition_head = None
+        if self._implicit_fast_ki_enabled():
+            selected_layers = [
+                layer % self.vlm_with_expert.num_vlm_layers for layer in config.implicit_iar_layers
+            ]
+            if len(set(selected_layers)) != len(selected_layers):
+                raise ValueError("Implicit IAR layers must be unique after runtime layer normalization.")
+            kv_size = (
+                self.vlm_with_expert.config.text_config.num_key_value_heads
+                * self.vlm_with_expert.config.text_config.head_dim
+            )
+            self.implicit_action_reasoner = ImplicitActionReasoner(
+                selected_layers,
+                kv_size,
+                self.vlm_with_expert.expert_hidden_size,
+                config.implicit_iar_num_queries,
+            )
+            self.fast_context_proj = nn.Linear(
+                self.vlm_with_expert.expert_hidden_size,
+                self.vlm_with_expert.config.text_config.hidden_size,
+            )
+            nn.init.normal_(self.fast_context_proj.weight, std=0.02)
+            nn.init.zeros_(self.fast_context_proj.bias)
+            self.implicit_transition_head = ImplicitAtomicTransitionHead(
+                self.vlm_with_expert.config.text_config.hidden_size,
+                self.vlm_with_expert.expert_hidden_size,
+            )
         self.skill_embedding = None
         self.transition_head = None
         self.phase_embedding = None
@@ -1260,6 +1461,9 @@ class VLAFlowMatching(nn.Module):
 
     def _atomic_classifier_enabled(self) -> bool:
         return getattr(self.config, "atomic_classifier_enabled", False)
+
+    def _implicit_fast_ki_enabled(self) -> bool:
+        return getattr(self.config, "implicit_fast_ki_enabled", False)
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -1357,18 +1561,17 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        state_emb = self.state_proj(state)
-        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
-        embs.append(state_emb)
-        bsize = state_emb.shape[0]
-        device = state_emb.device
+        bsize = lang_emb.shape[0]
+        if state is not None:
+            state_emb = self.state_proj(state)
+            state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+            embs.append(state_emb)
+            states_seq_len = state_emb.shape[1]
+            state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=state_emb.device)
+            pad_masks.append(state_mask)
 
-        states_seq_len = state_emb.shape[1]
-        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
-
-        # Set attention masks so that image and language inputs do not attend to state or actions
-        att_masks += [1] * (states_seq_len)
+            # Set attention masks so that image and language inputs do not attend to state or actions
+            att_masks += [1] * states_seq_len
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -1501,6 +1704,103 @@ class VLAFlowMatching(nn.Module):
             self.atomic_previous_skill_embedding(previous_skill.long().to(device=state.device)),
         )
 
+    def _implicit_context(self, past_key_values, prefix_pad_masks: Tensor) -> Tensor:
+        if self.implicit_action_reasoner is None:
+            raise RuntimeError("Implicit FAST-KI context requested while the intervention is disabled.")
+        return self.implicit_action_reasoner(past_key_values, prefix_pad_masks)
+
+    def _fused_implicit_context(self, implicit_context: Tensor, state: Tensor) -> Tensor:
+        state_context = self.state_proj(state)[:, None]
+        return torch.cat([self.fast_context_proj(implicit_context), state_context], dim=1)
+
+    def _implicit_transition_logits(
+        self,
+        fused_context: Tensor,
+        history_ids: Tensor | None,
+        history_valid: Tensor | None,
+    ) -> Tensor:
+        if self.implicit_transition_head is None:
+            raise RuntimeError("Implicit transition logits requested while the intervention is disabled.")
+        if history_ids is None or history_valid is None:
+            raise KeyError("Implicit transition planning requires two history IDs and validity masks.")
+        if history_ids.shape != (fused_context.shape[0], 2) or history_valid.shape != history_ids.shape:
+            raise ValueError("Implicit transition history must be aligned [batch, 2] tensors.")
+        history_valid = history_valid.bool()
+        if ((history_ids[history_valid] < 0) | (history_ids[history_valid] >= len(ATOMIC_SKILLS))).any():
+            raise ValueError("Valid implicit transition history IDs must index existing atomic skills.")
+        safe_ids = history_ids.long().masked_fill(~history_valid, 0)
+        history_embeddings = self.vlm_with_expert.atomic_router.skill_embeddings[safe_ids]
+        return self.implicit_transition_head(fused_context, history_embeddings, history_valid)
+
+    def _forward_implicit_action(
+        self,
+        fused_context: Tensor,
+        suffix_embs: Tensor,
+        suffix_pad_masks: Tensor,
+        suffix_att_masks: Tensor,
+        atomic_skill_id: Tensor,
+    ) -> Tensor:
+        context = fused_context.detach()
+        context_dtype = self.vlm_with_expert.get_vlm_model().text_model.get_input_embeddings().weight.dtype
+        context = context.to(dtype=context_dtype)
+        context_mask = torch.ones(context.shape[:2], dtype=torch.bool, device=context.device)
+        pad_masks = torch.cat([context_mask, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([torch.zeros_like(context_mask), suffix_att_masks.bool()], dim=1)
+        outputs, _ = self.vlm_with_expert.forward(
+            attention_mask=make_att_2d_masks(pad_masks, att_masks),
+            position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            past_key_values=None,
+            inputs_embeds=[context, suffix_embs],
+            use_cache=False,
+            atomic_skill_id=atomic_skill_id,
+        )
+        return outputs[1][:, -self.config.chunk_size :]
+
+    def _fast_losses(
+        self,
+        fused_context: Tensor,
+        fast_action_tokens: Tensor | None,
+        fast_action_masks: Tensor | None,
+    ) -> Tensor:
+        if fast_action_tokens is None or fast_action_masks is None:
+            raise KeyError(f"Implicit FAST-KI requires `{ACTION_TOKENS}` and `{ACTION_TOKEN_MASK}`.")
+        if fast_action_tokens.ndim != 2 or fast_action_tokens.shape != fast_action_masks.shape:
+            raise ValueError("FAST action tokens and masks must be aligned rank-2 tensors.")
+
+        context = fused_context
+        token_embs = self.vlm_with_expert.embed_language_tokens(fast_action_tokens)
+        token_embs = token_embs * math.sqrt(token_embs.shape[-1])
+        context = context.to(dtype=token_embs.dtype)
+        inputs = torch.cat([context, token_embs], dim=1)
+        context_mask = torch.ones(context.shape[:2], dtype=torch.bool, device=context.device)
+        pad_masks = torch.cat([context_mask, fast_action_masks.bool()], dim=1)
+
+        context_length = context.shape[1]
+        token_length = fast_action_tokens.shape[1]
+        attention_mask = torch.zeros(
+            inputs.shape[0], inputs.shape[1], inputs.shape[1], dtype=torch.bool, device=inputs.device
+        )
+        attention_mask[:, :context_length, :context_length] = True
+        attention_mask[:, context_length:, :context_length] = True
+        attention_mask[:, context_length:, context_length:] = torch.tril(
+            torch.ones(token_length, token_length, dtype=torch.bool, device=inputs.device)
+        )
+        attention_mask &= pad_masks[:, None] & pad_masks[:, :, None]
+
+        outputs, _ = self.vlm_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            past_key_values=None,
+            inputs_embeds=[inputs, None],
+            use_cache=False,
+        )
+        token_hidden = outputs[0][:, -token_length:-1]
+        logits = self.vlm_with_expert.vlm.lm_head(token_hidden).float()
+        targets = fast_action_tokens[:, 1:]
+        target_mask = fast_action_masks[:, 1:].to(dtype=logits.dtype)
+        losses = F.cross_entropy(logits.transpose(1, 2), targets, reduction="none") * target_mask
+        return losses.sum(dim=1) / target_mask.sum(dim=1).clamp_min(1)
+
     def forward(
         self,
         images,
@@ -1514,6 +1814,10 @@ class VLAFlowMatching(nn.Module):
         current_skill=None,
         current_phase=None,
         atomic_skill_id=None,
+        fast_action_tokens=None,
+        fast_action_masks=None,
+        transition_history_ids=None,
+        transition_history_valid=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1531,25 +1835,52 @@ class VLAFlowMatching(nn.Module):
             prefix_att_masks,
             visual_token_spans,
             task_token_span,
-        ) = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
+        ) = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=None if self._implicit_fast_ki_enabled() else state,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             x_t, time, current_skill=current_skill, current_phase=current_phase
         )
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            visual_token_spans=visual_token_spans,
-            atomic_skill_id=atomic_skill_id,
-        )
+        fast_losses = None
+        if self._implicit_fast_ki_enabled():
+            _, past_key_values = self.vlm_with_expert.forward(
+                attention_mask=make_att_2d_masks(prefix_pad_masks, prefix_att_masks),
+                position_ids=torch.cumsum(prefix_pad_masks, dim=1) - 1,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+            implicit_context = self._implicit_context(past_key_values, prefix_pad_masks)
+            fused_context = self._fused_implicit_context(implicit_context, state)
+            fast_losses = self._fast_losses(fused_context, fast_action_tokens, fast_action_masks)
+            implicit_transition_logits = self._implicit_transition_logits(
+                fused_context, transition_history_ids, transition_history_valid
+            )
+            prefix_out = None
+            suffix_out = self._forward_implicit_action(
+                fused_context,
+                suffix_embs,
+                suffix_pad_masks,
+                suffix_att_masks,
+                atomic_skill_id,
+            )
+        else:
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
+                attention_mask=make_att_2d_masks(pad_masks, att_masks),
+                position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                visual_token_spans=visual_token_spans,
+                atomic_skill_id=atomic_skill_id,
+            )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1565,6 +1896,8 @@ class VLAFlowMatching(nn.Module):
             )
         if self._phase_masking_enabled():
             return losses, self._phase_logits_from_suffix(suffix_out)
+        if fast_losses is not None:
+            return losses, fast_losses, implicit_transition_logits
         return losses
 
     def sample_actions(
@@ -1578,6 +1911,8 @@ class VLAFlowMatching(nn.Module):
         current_skill: Tensor | None = None,
         current_phase: Tensor | None = None,
         atomic_skill_id: Tensor | None = None,
+        transition_history_ids: Tensor | None = None,
+        transition_history_valid: Tensor | None = None,
         task_descriptions: list[str] | tuple[str, ...] | str | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
@@ -1595,7 +1930,13 @@ class VLAFlowMatching(nn.Module):
             prefix_att_masks,
             visual_token_spans,
             task_token_span,
-        ) = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
+        ) = self.embed_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state=None if self._implicit_fast_ki_enabled() else state,
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
@@ -1606,6 +1947,16 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
         )
+        implicit_context = None
+        implicit_transition_logits = None
+        if self._implicit_fast_ki_enabled():
+            implicit_context = self._fused_implicit_context(
+                self._implicit_context(past_key_values, prefix_pad_masks), state
+            ).detach()
+            implicit_transition_logits = self._implicit_transition_logits(
+                implicit_context, transition_history_ids, transition_history_valid
+            )
+            atomic_skill_id = implicit_transition_logits.argmax(dim=-1)
         transition_logits = None
         if self._skill_linking_enabled():
             transition_logits = self._transition_logits_from_prefix(
@@ -1632,6 +1983,7 @@ class VLAFlowMatching(nn.Module):
                     current_skill=current_skill,
                     current_phase=current_phase,
                     atomic_skill_id=atomic_skill_id,
+                    implicit_context=implicit_context,
                 )
                 if self._phase_masking_enabled():
                     velocity, latest_auxiliary_logits = denoise_out
@@ -1648,6 +2000,8 @@ class VLAFlowMatching(nn.Module):
                 prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
                 execution_horizon=kwargs.get("execution_horizon"),
             )
+            if self._implicit_fast_ki_enabled():
+                return actions, implicit_transition_logits
             if self._skill_linking_enabled():
                 return actions, transition_logits
             if not self._phase_masking_enabled():
@@ -1669,6 +2023,7 @@ class VLAFlowMatching(nn.Module):
         current_skill: Tensor | None = None,
         current_phase: Tensor | None = None,
         atomic_skill_id: Tensor | None = None,
+        implicit_context: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         if (
@@ -1698,19 +2053,30 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
-            attention_mask=full_att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=self.config.use_cache,
-            visual_token_spans=visual_token_spans,
-            atomic_skill_id=atomic_skill_id,
-        )
-        if past_key_values is not None:
-            # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
-            past_key_values.crop(prefix_len)
-        suffix_out = outputs_embeds[1]
+        if self._implicit_fast_ki_enabled():
+            if implicit_context is None:
+                raise ValueError("Implicit FAST-KI denoising requires projected context.")
+            suffix_out = self._forward_implicit_action(
+                implicit_context,
+                suffix_embs,
+                suffix_pad_masks,
+                suffix_att_masks,
+                atomic_skill_id,
+            )
+        else:
+            outputs_embeds, _ = self.vlm_with_expert.forward(
+                attention_mask=full_att_2d_masks,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=self.config.use_cache,
+                visual_token_spans=visual_token_spans,
+                atomic_skill_id=atomic_skill_id,
+            )
+            if past_key_values is not None:
+                # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
+                past_key_values.crop(prefix_len)
+            suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
