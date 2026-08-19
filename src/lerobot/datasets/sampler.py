@@ -347,7 +347,7 @@ class SkillLinkingSampler(EpisodeAwareSampler):
 
 
 class AtomicSkillSampler(EpisodeAwareSampler):
-    """Balance six atomic skills, optionally mixing classifier events 75:25."""
+    """Shuffle atomic action frames naturally, optionally mixing classifier events 75:25."""
 
     def __init__(
         self,
@@ -364,6 +364,7 @@ class AtomicSkillSampler(EpisodeAwareSampler):
             dataset_from_indices,
             dataset_to_indices,
             episode_indices_to_use=episode_indices_to_use,
+            shuffle=not classifier_event_sampling,
             seed=seed,
             absolute_to_relative_idx=absolute_to_relative_idx,
         )
@@ -404,7 +405,7 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                 else:
                     self._skill_candidates[skill].append(relative_idx)
                 previous_skill = skill
-        if any(not candidates for candidates in self._skill_candidates):
+        if classifier_event_sampling and any(not candidates for candidates in self._skill_candidates):
             raise ValueError("Every atomic skill must have at least one train anchor.")
         self._event_candidates = [*self._start_candidates, *self._boundary_candidates]
         if classifier_event_sampling:
@@ -425,6 +426,10 @@ class AtomicSkillSampler(EpisodeAwareSampler):
         return list(self._event_candidates)
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
+        if not self._classifier_event_sampling:
+            yield from super()._iter_epoch(epoch, start)
+            return
+
         generator = self._epoch_generator(epoch)
         if self._classifier_event_sampling:
             num_regular = 3 * (self._num_frames // 4)
@@ -443,14 +448,6 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                 if position >= start:
                     yield candidate
             return
-
-        skill_order = torch.arange(self._num_frames) % 6
-        skill_order = skill_order[torch.randperm(self._num_frames, generator=generator)]
-        for position in range(self._num_frames):
-            candidates = self._skill_candidates[int(skill_order[position])]
-            candidate = torch.randint(len(candidates), (), generator=generator).item()
-            if position >= start:
-                yield candidates[candidate]
 
 
 def compute_sampler_state(step: int, num_frames: int, batch_size: int, num_processes: int) -> dict:

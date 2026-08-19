@@ -175,24 +175,34 @@ def test_atomic_classifier_prefix_prefill_skips_missing_expert_tokens():
     assert logits.shape == (1, 6)
 
 
-def test_atomic_sampler_is_balanced_deterministic_and_resumable():
-    sampler = AtomicSkillSampler(
-        [0],
-        [60],
-        subtask_indices=[index % 6 for index in range(60)],
-        subtask_to_skill=list(range(6)),
-        seed=42,
-    )
-    first_epoch = list(sampler)
-    assert [index % 6 for index in first_epoch].count(0) == 10
-    assert all([index % 6 for index in first_epoch].count(skill) == 10 for skill in range(6))
-    assert first_epoch == list(
-        AtomicSkillSampler([0], [60], [index % 6 for index in range(60)], list(range(6)), seed=42)
-    )
+def test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly():
+    labels = [0, 0, 0, 1, 2, 3, 4, 5, 5]
+    absolute_to_relative = {
+        **dict(zip(range(100, 104), range(4), strict=True)),
+        **dict(zip(range(110, 115), range(4, 9), strict=True)),
+    }
 
-    resumed = AtomicSkillSampler([0], [60], [index % 6 for index in range(60)], list(range(6)), seed=42)
-    resumed.load_state_dict({"epoch": 0, "start_index": 17})
-    assert list(resumed) == first_epoch[17:]
+    def make_sampler():
+        return AtomicSkillSampler(
+            [100, 104, 110],
+            [104, 110, 115],
+            subtask_indices=labels,
+            subtask_to_skill=list(range(6)),
+            episode_indices_to_use=[0, 2],
+            seed=42,
+            absolute_to_relative_idx=absolute_to_relative,
+        )
+
+    sampler = make_sampler()
+    first_epoch = list(sampler)
+    assert sorted(first_epoch) == list(range(9))
+    sampled_skills = [labels[index] for index in first_epoch]
+    assert [sampled_skills.count(skill) for skill in range(6)] == [3, 1, 1, 1, 1, 2]
+    assert first_epoch == list(make_sampler())
+
+    resumed = make_sampler()
+    resumed.load_state_dict({"epoch": 0, "start_index": 4})
+    assert list(resumed) == first_epoch[4:]
 
     with pytest.raises(ValueError, match="exactly cover"):
         AtomicSkillSampler([0], [6], list(range(6)), [0, 1, 2, 3, 4, 5, 0])

@@ -149,3 +149,38 @@ The targeted pytest process was stopped after the environment import failure; no
 - Per-skill group/overall rates are micro-aggregated from event counts, not inferred from timeline transitions.
 - This is a privileged-state GT-routing diagnostic, not AtomicVLA's learned think/act method and not a new
   preregistered primary or secondary outcome. No experimental result is interpreted here.
+
+## Natural-distribution action sampler (2026-08-19)
+
+Results inspected: none. No metric, dataset, seed, loss mask, or evaluation criterion changed.
+
+### Changed files and configuration
+
+- `src/lerobot/datasets/sampler.py`: with the existing `classifier_event_sampling=False`, selected episode
+  frames now use the base sampler's deterministic shuffled traversal exactly once per epoch; episode filtering,
+  absolute-to-relative mapping, and resume offsets are preserved. `classifier_event_sampling=True` retains its
+  existing 75:25 stay/event replacement sampling. Non-atomic training remains behind existing configuration.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`: replaced the balanced-action test with imbalanced natural-count,
+  exact coverage, deterministic-order, filtered/index-mapped episode, and exact resume-suffix coverage. The
+  classifier sampler test is unchanged.
+
+### Commands and exact results
+
+```bash
+uv run pytest tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_atomic_classifier_sampler_draws_current_boundaries_75_25 -q
+# Collection failed before tests ran: ImportError: libcublasLt.so.12 was unavailable.
+
+uv run ruff check src/lerobot/datasets/sampler.py tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed!
+
+/usr/bin/python3 -m py_compile src/lerobot/datasets/sampler.py tests/policies/smolvla/test_atomic_sgmoe.py
+# Passed.
+```
+
+### Assumptions and deviations
+
+- This pre-result user-directed change supersedes the balanced replacement sampling in frozen plan section 4.6
+  and its equal-frequency Gate 3 assertion for SG-MoE/action training only. Skill-boundary masking remains a
+  separate unchanged experiment variable.
+- No dependency repair, training, evaluation, checkpoint write, or raw-result mutation was performed.
