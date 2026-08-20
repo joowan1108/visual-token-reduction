@@ -205,3 +205,22 @@ SmolVLA의 VLM이 six-way routing을 잘할지는 사전 보장할 수 없다. S
 - Long success 개선이 parameter 증가가 아니라 skill routing에서 온다.
 
 따라서 결론은 task success뿐 아니라 routing·skill별 action 성능·경계 품질을 함께 보고하고, 실패가 action expert와 frozen VLM 중 어디서 발생했는지 분리해야 한다.
+
+## 9. Think/Act 불균형 감사 (2026-08-20)
+
+AtomicVLA 논문은 `[think]`를 task 시작과 skill 전환에서, `[act]`를 현재 skill의 action 생성에서 사용하지만
+두 mode의 class weight나 균형 sampler를 보고하지 않는다. 공식 구현 commit `c3583055`는 실제 경계 한 frame만
+학습하지 않고 episode 첫 11 frame, 각 경계 전 6 frame, 경계 후 6 frame을 deterministic `[think]` window로
+확장한다. 공개 annotation에 이 규칙을 적용하면 `[think]`는 약 16.36%, `[act]`는 약 83.64%다. decision CE는
+두 class에 동일하며, `1/20`은 decision objective 전체의 계수이지 switch class weight가 아니다.
+
+따라서 본 구현의 exact switch CE 4배는 AtomicVLA 재현으로 정당화할 수 없다. 반면 AtomicVLA의 pre-boundary
+next-skill label을 그대로 복사하면, strict boundary masking으로 다음 expert가 old-skill transition action을 배우지
+않은 본 SG-MoE를 너무 일찍 전환시킬 수 있다. 자연 label timing을 유지하면서 다수의 쉬운 stay example이
+gradient를 지배하지 않게 하는 별도 adaptation으로 focal CE를 사용한다. Focal Loss는 잘 분류된 다수 example을
+자동 down-weight하고 hard example에 집중하도록 제안된 표준 objective이며, 본 조건은 class alpha 없이
+`gamma=2`를 고정한다. 이 선택은 AtomicVLA의 공개 구현과 동일하다는 주장이 아니라 관련-result-informed
+ablation이다.
+
+근거: AtomicVLA Sec. 3.2/Algorithm 1 및 공식 `atomic_dataset.py`, `pi0_atomic.py` commit `c3583055`;
+Lin et al., *Focal Loss for Dense Object Detection*, arXiv:1708.02002.

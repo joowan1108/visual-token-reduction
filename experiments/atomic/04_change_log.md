@@ -250,7 +250,7 @@ implicit_iar_layers=[-4,-3,-2,-1]
 implicit_iar_num_queries=4
 implicit_fast_loss_weight=0.1
 implicit_transition_loss_weight=0.1
-implicit_transition_switch_weight=4.0
+implicit_transition_focal_gamma=2.0
 implicit_fast_max_action_tokens=256
 implicit_fast_skip_tokens=128
 implicit_fast_action_tokenizer_name=lerobot/fast-action-tokenizer
@@ -264,18 +264,19 @@ The transition head is always active with implicit FAST-KI and replaces the froz
 condition.
 The existing atomic `chunk_size=10`, `n_action_steps`, mapping, and boundary contract are unchanged.
 
-### Natural-transition switch-loss amendment (2026-08-20)
+### Natural-transition focal-loss amendment (2026-08-20)
 
-- Added positive finite `implicit_transition_switch_weight=4.0`. Only valid-history samples whose target differs
-  from the latest executed skill receive this multiplier; stay and no-history samples remain weight 1.
-- The weighted transition CE is logged as `implicit_transition_loss` and enters both scalar and per-sample total
-  loss paths. Transition accuracy/event metrics remain unweighted, and gradient ownership is unchanged.
-- Natural switch prevalence is approximately 4%; 4x gives about 14% effective loss prevalence without changing
-  the natural flow/FAST sampler. This is intentionally milder than the prior 75:25 sampler that harmed precision.
-- Scoped Ruff, `py_compile`, and semantic diff checks passed. The focused pytest timed out before collection;
-  direct torch import remains blocked by missing `libcublasLt.so.12`.
+- The previously implemented fixed 4x switch multiplier is superseded and removed. Official AtomicVLA commit
+  `c3583055` instead uses deterministic `[think]` windows over the first 11 episode frames and six frames on
+  each side of a skill boundary; it does not provide a switch class weight.
+- Added finite non-negative `implicit_transition_focal_gamma=2.0`. The focal objective enters both scalar and
+  per-sample total losses; `gamma=0` exactly recovers plain CE.
+- `implicit_transition_ce` logs unweighted CE while `implicit_transition_loss` logs the actual focal objective.
+  Sampling, targets/history, unweighted metrics, detach paths, and gradient ownership are unchanged.
 - Held-out evaluation now aggregates and logs the existing stay/switch counts for implicit FAST-KI as well as
   the legacy atomic classifier; metric definitions and training behavior are unchanged.
+- Scoped Ruff, `py_compile`, and semantic diff checks passed; focused pytest remained blocked by the local
+  PyTorch import failure for missing `libcublasLt.so.12`.
 
 ### Commands and exact results
 

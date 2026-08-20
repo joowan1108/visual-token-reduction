@@ -19,7 +19,7 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     ImplicitAtomicTransitionHead,
     SmolVLAPolicy,
     VLAFlowMatching,
-    _weight_implicit_transition_loss,
+    _implicit_transition_focal_loss,
     atomic_classifier_event_counts,
     parse_atomic_planner_output,
 )
@@ -373,12 +373,9 @@ def test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage()
     history_valid = torch.ones(2, 2, dtype=torch.bool)
     transition_logits = flow_model._implicit_transition_logits(transition_context, history_ids, history_valid)
     transition_target = torch.tensor([1, 4])
-    _weight_implicit_transition_loss(
+    _implicit_transition_focal_loss(
         torch.nn.functional.cross_entropy(transition_logits, transition_target, reduction="none"),
-        transition_target,
-        history_ids,
-        history_valid,
-        switch_weight=4.0,
+        gamma=config.implicit_transition_focal_gamma,
     ).mean().backward()
     assert any(parameter.grad is not None for parameter in flow_model.implicit_transition_head.parameters())
     assert all(parameter.grad is None for parameter in reasoner.parameters())
@@ -473,7 +470,7 @@ def test_implicit_transition_history_anchors_are_episode_safe_and_reset_per_batc
     assert policy._implicit_transition_history_valid is None
 
 
-def test_implicit_transition_switch_weighting_and_validation():
+def test_implicit_transition_focal_loss_and_validation():
     implicit_config = {
         "chunk_size": 10,
         "n_action_steps": 5,
@@ -484,21 +481,22 @@ def test_implicit_transition_switch_weighting_and_validation():
         "pretrained_path": Path("local-checkpoint"),
     }
     config = SmolVLAConfig(**implicit_config)
-    assert config.implicit_transition_switch_weight == 4.0
-    for invalid_weight in (0.0, -1.0, float("inf"), float("nan")):
-        with pytest.raises(ValueError, match="implicit_transition_switch_weight"):
-            SmolVLAConfig(**implicit_config, implicit_transition_switch_weight=invalid_weight)
-
-    losses = torch.tensor([1.0, 2.0, 3.0])
-    weighted = _weight_implicit_transition_loss(
-        losses,
-        target=torch.tensor([5, 2, 4]),
-        history_ids=torch.tensor([[0, 1], [1, 2], [2, 3]]),
-        history_valid=torch.tensor([[False, False], [True, True], [True, True]]),
-        switch_weight=config.implicit_transition_switch_weight,
+    assert config.implicit_transition_focal_gamma == 2.0
+    assert (
+        SmolVLAConfig(**implicit_config, implicit_transition_focal_gamma=0).implicit_transition_focal_gamma
+        == 0
     )
-    torch.testing.assert_close(weighted, torch.tensor([1.0, 2.0, 12.0]))
-    assert "_weight_implicit_transition_loss" in inspect.getsource(SmolVLAPolicy.forward)
+    for invalid_gamma in (-1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="implicit_transition_focal_gamma"):
+            SmolVLAConfig(**implicit_config, implicit_transition_focal_gamma=invalid_gamma)
+
+    cross_entropy = torch.tensor([0.1, 2.0])
+    torch.testing.assert_close(
+        _implicit_transition_focal_loss(cross_entropy, gamma=0), cross_entropy, rtol=0, atol=0
+    )
+    relative_factor = _implicit_transition_focal_loss(cross_entropy, gamma=2) / cross_entropy
+    assert relative_factor[1] > relative_factor[0]
+    assert "_implicit_transition_focal_loss" in inspect.getsource(SmolVLAPolicy.forward)
 
 
 def test_atomic_classifier_uses_previous_and_current_frame_labels():

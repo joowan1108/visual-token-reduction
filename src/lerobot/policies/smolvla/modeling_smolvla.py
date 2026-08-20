@@ -116,15 +116,8 @@ def atomic_classifier_event_counts(
     }
 
 
-def _weight_implicit_transition_loss(
-    losses: Tensor,
-    target: Tensor,
-    history_ids: Tensor,
-    history_valid: Tensor,
-    switch_weight: float,
-) -> Tensor:
-    switch = history_valid[:, -1] & (target != history_ids[:, -1])
-    return torch.where(switch, losses * switch_weight, losses)
+def _implicit_transition_focal_loss(cross_entropy: Tensor, gamma: float) -> Tensor:
+    return cross_entropy * (1 - torch.exp(-cross_entropy)).pow(gamma)
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -952,17 +945,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        implicit_transition_ce = None
         implicit_transition_losses = None
         if implicit_transition_logits is not None:
-            implicit_transition_losses = F.cross_entropy(
+            implicit_transition_ce = F.cross_entropy(
                 implicit_transition_logits, implicit_transition_target, reduction="none"
             )
-            implicit_transition_losses = _weight_implicit_transition_loss(
-                implicit_transition_losses,
-                implicit_transition_target,
-                transition_history_ids,
-                transition_history_valid,
-                self.config.implicit_transition_switch_weight,
+            implicit_transition_losses = _implicit_transition_focal_loss(
+                implicit_transition_ce, self.config.implicit_transition_focal_gamma
             )
             prediction = implicit_transition_logits.argmax(dim=-1)
             previous_skill = torch.where(
@@ -970,6 +960,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 transition_history_ids[:, -1],
                 torch.full_like(transition_history_ids[:, -1], len(ATOMIC_SKILLS)),
             )
+            loss_dict["implicit_transition_ce"] = implicit_transition_ce.mean().item()
             loss_dict["implicit_transition_loss"] = implicit_transition_losses.mean().item()
             loss_dict["implicit_transition_accuracy"] = (
                 (prediction == implicit_transition_target).float().mean().item()

@@ -296,3 +296,14 @@ full implementation 준비 완료의 기준은 다음과 같다.
 - boundary mask와 exact init-state pairing test가 통과한다.
 - raw 결과 경로가 append-only이고 재실행으로 기존 결과를 덮어쓰지 않는다.
 
+## 10. AtomicVLA transition supervision 대응 (2026-08-20)
+
+공식 AtomicVLA commit `c3583055`의 transition supervision은 class-weighted switch head가 아니라 경계 전후
+deterministic `[think]` window다. 본 transition head는 reasoning mode를 생성하지 않고 현재 실행할 six-way skill을
+직접 예측하며, SG-MoE action loss는 strict current-skill boundary mask를 사용한다. 따라서 official pre-boundary
+next-skill target을 이 경로에 합치지 않는다.
+
+고정 4배 switch CE는 제거하고 unreduced six-way CE에 `(1 - exp(-CE)) ** gamma`를 적용한다. 기본
+`implicit_transition_focal_gamma=2.0`이며 `gamma=0`은 plain CE ablation이다. Sampling, target timing, unweighted
+stay/switch metrics, transition-head-only gradient ownership은 바꾸지 않는다. Training log에는 focal objective와
+plain CE를 분리해 남기고, natural held-out split의 stay accuracy와 switch precision/recall로 checkpoint를 비교한다.
