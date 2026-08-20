@@ -359,7 +359,10 @@ class AtomicSkillSampler(EpisodeAwareSampler):
         seed: int = 0,
         absolute_to_relative_idx: dict[int, int] | None = None,
         classifier_event_sampling: bool = False,
+        anchor_stride: int = 1,
     ):
+        if anchor_stride < 1:
+            raise ValueError(f"anchor_stride must be >= 1, got {anchor_stride}")
         super().__init__(
             dataset_from_indices,
             dataset_to_indices,
@@ -383,11 +386,16 @@ class AtomicSkillSampler(EpisodeAwareSampler):
             episode_mask[np.asarray(episode_indices_to_use, dtype=np.int64)] = True
 
         self._classifier_event_sampling = classifier_event_sampling
+        self._retained_candidates: list[int] | None = (
+            [] if not classifier_event_sampling and anchor_stride > 1 else None
+        )
+        self._retained_candidate_counts = {"start": 0, "switch": 0, "stay": 0}
         self._start_candidates: list[int] = []
         self._boundary_candidates: list[int] = []
         self._skill_candidates = [[] for _ in range(6)]
         for start, end in zip(from_indices[episode_mask], to_indices[episode_mask], strict=True):
             previous_skill = None
+            segment_start = int(start)
             for absolute_idx in range(int(start), int(end)):
                 relative_idx = (
                     absolute_idx
@@ -404,6 +412,18 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                     self._boundary_candidates.append(relative_idx)
                 else:
                     self._skill_candidates[skill].append(relative_idx)
+                if self._retained_candidates is not None:
+                    kind = None
+                    if absolute_idx == start:
+                        kind = "start"
+                    elif skill != previous_skill:
+                        segment_start = absolute_idx
+                        kind = "switch"
+                    elif (absolute_idx - segment_start) % anchor_stride == 0:
+                        kind = "stay"
+                    if kind is not None:
+                        self._retained_candidates.append(relative_idx)
+                        self._retained_candidate_counts[kind] += 1
                 previous_skill = skill
         if classifier_event_sampling and any(not candidates for candidates in self._skill_candidates):
             raise ValueError("Every atomic skill must have at least one train anchor.")
@@ -412,6 +432,8 @@ class AtomicSkillSampler(EpisodeAwareSampler):
             if not self._boundary_candidates:
                 raise ValueError("Atomic classifier sampling found no skill boundaries.")
             self._num_frames = 4 * math.ceil(self._num_frames / 4)
+        elif self._retained_candidates is not None:
+            self._num_frames = len(self._retained_candidates)
 
     @property
     def classifier_candidate_counts(self) -> dict[str, int]:
@@ -424,6 +446,15 @@ class AtomicSkillSampler(EpisodeAwareSampler):
     @property
     def event_candidates(self) -> list[int]:
         return list(self._event_candidates)
+
+    @property
+    def retained_candidate_counts(self) -> dict[str, int]:
+        return dict(self._retained_candidate_counts)
+
+    def _frame_index(self, position: int) -> int:
+        if self._retained_candidates is not None:
+            return self._retained_candidates[position]
+        return super()._frame_index(position)
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         if not self._classifier_event_sampling:

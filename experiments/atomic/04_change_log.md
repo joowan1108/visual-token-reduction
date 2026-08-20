@@ -389,3 +389,15 @@ timeout 15s uv run python -c 'import torch; print(torch.__version__)'
   fused result, so flow cannot update IAR or either projection.
 - This implementation does not authorize or add training/evaluation runs. Any future results belong to a
   separately named opt-in condition and must not replace or be pooled with the original preregistered A/B result.
+
+## Atomic temporal anchor thinning (2026-08-20)
+
+Added opt-in `atomic_anchor_stride` (default `1`). In natural atomic sampling, values above one retain every
+episode start and mapped-skill boundary, then retain stay anchors at segment-relative stride offsets. The
+requested condition uses stride `5` and `chunk_size=20`; stride `1` preserves the existing `chunk_size=10`
+baseline, while classifier 75:25 sampling ignores the stride.
+
+Training logs exact retained `start`/`switch`/`stay` counts. Tests cover stride-5 anchors, same-skill subtask
+changes, true boundary direction, deterministic shuffle/resume, baseline compatibility, and classifier
+invariance. Ruff, `py_compile`, and diff checks passed; focused pytest timed out before collection in the local
+CUDA environment.

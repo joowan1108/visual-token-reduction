@@ -37,6 +37,10 @@ from lerobot.utils.constants import ACTION, ACTION_TOKEN_MASK, ACTION_TOKENS, OB
 
 def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
     assert SmolVLAConfig().atomic_sgmoe_enabled is False
+    assert SmolVLAConfig().atomic_anchor_stride == 1
+    for invalid_stride in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="atomic_anchor_stride"):
+            SmolVLAConfig(atomic_anchor_stride=invalid_stride)
     config = SmolVLAConfig(
         chunk_size=10,
         n_action_steps=5,
@@ -45,6 +49,17 @@ def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
         atomic_subtask_to_skill=list(range(6)),
     )
     assert config.subtask_delta_indices == list(range(10))
+    thinned = SmolVLAConfig(
+        chunk_size=20,
+        n_action_steps=5,
+        atomic_data_enabled=True,
+        atomic_sgmoe_enabled=True,
+        atomic_anchor_stride=5,
+        atomic_subtask_to_skill=list(range(6)),
+    )
+    assert thinned.subtask_delta_indices == list(range(20))
+    with pytest.raises(ValueError, match="chunk_size=20"):
+        replace(thinned, chunk_size=10)
     with pytest.raises(ValueError, match="load_vlm_weights=True"):
         SmolVLAConfig(
             chunk_size=10,
@@ -592,18 +607,57 @@ def test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly():
         AtomicSkillSampler([0], [6], list(range(6)), [0, 1, 2, 3, 4, 5, 0])
 
 
+def test_atomic_sampler_thins_stays_from_each_mapped_boundary_and_resumes_exactly():
+    labels = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 6, 6]
+    mapping = [0, 0, 1, 2, 3, 4, 5]
+
+    def make_sampler():
+        return AtomicSkillSampler(
+            [0, 16],
+            [16, 27],
+            subtask_indices=labels,
+            subtask_to_skill=mapping,
+            seed=42,
+            anchor_stride=5,
+        )
+
+    sampler = make_sampler()
+    expected = [0, 5, 8, 13, 15, 16, 21, 22, 23, 24]
+    assert sampler.indices == expected
+    assert sampler.retained_candidate_counts == {"start": 2, "switch": 5, "stay": 3}
+    assert labels[2] != labels[3] and mapping[labels[2]] == mapping[labels[3]]
+    assert 3 not in sampler.indices
+    assert [(mapping[labels[index - 1]], mapping[labels[index]]) for index in (8, 15, 22, 23, 24)] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 5),
+    ]
+
+    first_epoch = list(sampler)
+    assert sorted(first_epoch) == expected
+    assert first_epoch == list(make_sampler())
+    resumed = make_sampler()
+    resumed.load_state_dict({"epoch": 0, "start_index": 4})
+    assert list(resumed) == first_epoch[4:]
+
+
 def test_atomic_classifier_sampler_draws_current_boundaries_75_25():
     labels = [0, 0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
-    sampler = AtomicSkillSampler(
-        [0],
-        [len(labels)],
-        subtask_indices=labels,
-        subtask_to_skill=[0, 0, 1, 2, 3, 4, 5],
-        seed=42,
-        classifier_event_sampling=True,
-    )
+    kwargs = {
+        "dataset_from_indices": [0],
+        "dataset_to_indices": [len(labels)],
+        "subtask_indices": labels,
+        "subtask_to_skill": [0, 0, 1, 2, 3, 4, 5],
+        "seed": 42,
+        "classifier_event_sampling": True,
+    }
+    baseline = AtomicSkillSampler(**kwargs)
+    sampler = AtomicSkillSampler(**kwargs, anchor_stride=99)
     samples = list(sampler)
 
+    assert samples == list(baseline)
     assert sampler.classifier_candidate_counts == {"stay": 7, "start": 1, "switch": 5}
     assert set(sampler.event_candidates) == {0, 3, 5, 7, 9, 11}
     assert all(sample in sampler.event_candidates for sample in samples[3::4])

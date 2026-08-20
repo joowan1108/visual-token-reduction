@@ -398,12 +398,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             seed=cfg.seed if cfg.seed is not None else 0,
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
             classifier_event_sampling=getattr(active_cfg, "atomic_classifier_enabled", False),
+            anchor_stride=active_cfg.atomic_anchor_stride,
         )
         if is_main_process and getattr(active_cfg, "atomic_classifier_enabled", False):
             counts = atomic_sampler.classifier_candidate_counts
             logging.info(
                 "Atomic classifier sampler: 75%% stay / 25%% event; candidates=%s",
                 counts,
+            )
+        elif is_main_process and active_cfg.atomic_anchor_stride > 1:
+            logging.info(
+                "Atomic natural sampler: anchor_stride=%d; retained candidates=%s",
+                active_cfg.atomic_anchor_stride,
+                atomic_sampler.retained_candidate_counts,
             )
 
     if cfg.is_reward_model_training:

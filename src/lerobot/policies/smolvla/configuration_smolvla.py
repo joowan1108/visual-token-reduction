@@ -76,6 +76,7 @@ class SmolVLAConfig(PreTrainedConfig):
     atomic_sgmoe_enabled: bool = False
     atomic_planner_enabled: bool = False
     atomic_classifier_enabled: bool = False
+    atomic_anchor_stride: int = 1
     atomic_subtask_to_skill: list[int] | None = None
     atomic_subtask_to_skill_path: str | None = None
 
@@ -215,9 +216,21 @@ class SmolVLAConfig(PreTrainedConfig):
                     )
         if self.skill_linking_sampler_enabled and self.n_action_steps <= 0:
             raise ValueError("Skill-linking sampling requires `n_action_steps > 0`.")
+        if (
+            isinstance(self.atomic_anchor_stride, bool)
+            or not isinstance(self.atomic_anchor_stride, int)
+            or self.atomic_anchor_stride < 1
+        ):
+            raise ValueError("`atomic_anchor_stride` must be an integer >= 1.")
         if self.atomic_data_enabled:
-            if self.chunk_size != 10 or not 0 < self.n_action_steps <= self.chunk_size:
+            if self.atomic_anchor_stride == 1 and (
+                self.chunk_size != 10 or not 0 < self.n_action_steps <= 10
+            ):
                 raise ValueError("Atomic experiments require chunk_size=10 and 1 <= n_action_steps <= 10.")
+            if self.atomic_anchor_stride > 1 and (self.chunk_size != 20 or not 0 < self.n_action_steps <= 20):
+                raise ValueError(
+                    "Atomic anchor thinning requires chunk_size=20 and 1 <= n_action_steps <= 20."
+                )
             if self.atomic_subtask_to_skill is None and self.atomic_subtask_to_skill_path is None:
                 raise ValueError(
                     "`atomic_subtask_to_skill` or `atomic_subtask_to_skill_path` is required when atomic data handling is enabled."
