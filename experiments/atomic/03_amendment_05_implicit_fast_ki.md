@@ -14,7 +14,8 @@ through the repository's `pretrained_path` checkpoint path; a fully scratch rand
 The existing `state_proj` remains trainable and `train_state_proj=True` is required. The frozen defaults are
 selected VLM layers `[-4, -3, -2, -1]`, four learnable queries per layer,
 FAST loss weight `0.1`, at most 256 action tokens, 128 skipped vocabulary slots, and
-`lerobot/fast-action-tokenizer`. The dedicated transition CE weight is `0.1`.
+`lerobot/fast-action-tokenizer`. The dedicated transition CE weight is `0.1`, and the implicit transition
+switch-sample weight is `4.0`.
 
 Each selected layer independently owns `Q_i`, `Wq_i`, `Wk_i`, and `Wv_i`, initialized from a small normal
 distribution (`std=0.02`). Its detached raw SmolVLM K/V is projected by query attention; projected layer
@@ -32,6 +33,13 @@ Training uses
 
 `loss = masked_flow_loss + implicit_fast_loss_weight * masked_FAST_next_token_loss +
 implicit_transition_loss_weight * atomic_transition_CE`.
+
+The transition CE remains unreduced until each sample is classified as stay or switch. A sample receives the
+`implicit_transition_switch_weight` only when its latest history slot is valid and its target differs from that
+latest executed skill; stay and episode-start/no-history samples retain weight 1. Metrics remain unweighted.
+Natural-distribution labels contain approximately 4% switches, so the frozen 4x multiplier gives switches an
+effective loss prevalence of about 14% (`4 * .04 / (.96 + 4 * .04)`). This is intentionally less aggressive
+than the prior 75:25 replacement sampler, which harmed transition precision, and does not alter sampling.
 
 FAST teacher forcing reuses the frozen SmolVLM autoregressive transformer and LM head. It trains IAR and the
 single expert-to-VLM context projection plus the existing state projection, but not SmolVLM, the vision encoder,

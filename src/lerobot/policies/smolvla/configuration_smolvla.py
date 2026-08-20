@@ -85,6 +85,7 @@ class SmolVLAConfig(PreTrainedConfig):
     implicit_iar_num_queries: int = 4
     implicit_fast_loss_weight: float = 0.1
     implicit_transition_loss_weight: float = 0.1
+    implicit_transition_switch_weight: float = 4.0
     implicit_fast_max_action_tokens: int = 256
     implicit_fast_skip_tokens: int = 128
     implicit_fast_action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
@@ -286,6 +287,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 or self.implicit_transition_loss_weight <= 0
             ):
                 raise ValueError("`implicit_transition_loss_weight` must be positive and finite.")
+            if (
+                not math.isfinite(self.implicit_transition_switch_weight)
+                or self.implicit_transition_switch_weight <= 0
+            ):
+                raise ValueError("`implicit_transition_switch_weight` must be positive and finite.")
             if self.implicit_fast_max_action_tokens < 2:
                 raise ValueError("`implicit_fast_max_action_tokens` must be at least 2.")
             if self.atomic_classifier_enabled:

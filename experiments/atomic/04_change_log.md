@@ -250,6 +250,7 @@ implicit_iar_layers=[-4,-3,-2,-1]
 implicit_iar_num_queries=4
 implicit_fast_loss_weight=0.1
 implicit_transition_loss_weight=0.1
+implicit_transition_switch_weight=4.0
 implicit_fast_max_action_tokens=256
 implicit_fast_skip_tokens=128
 implicit_fast_action_tokenizer_name=lerobot/fast-action-tokenizer
@@ -262,6 +263,17 @@ It also requires `load_vlm_weights=true` or a policy loaded through `pretrained_
 The transition head is always active with implicit FAST-KI and replaces the frozen atomic planner for this
 condition.
 The existing atomic `chunk_size=10`, `n_action_steps`, mapping, and boundary contract are unchanged.
+
+### Natural-transition switch-loss amendment (2026-08-20)
+
+- Added positive finite `implicit_transition_switch_weight=4.0`. Only valid-history samples whose target differs
+  from the latest executed skill receive this multiplier; stay and no-history samples remain weight 1.
+- The weighted transition CE is logged as `implicit_transition_loss` and enters both scalar and per-sample total
+  loss paths. Transition accuracy/event metrics remain unweighted, and gradient ownership is unchanged.
+- Natural switch prevalence is approximately 4%; 4x gives about 14% effective loss prevalence without changing
+  the natural flow/FAST sampler. This is intentionally milder than the prior 75:25 sampler that harmed precision.
+- Scoped Ruff, `py_compile`, and semantic diff checks passed. The focused pytest timed out before collection;
+  direct torch import remains blocked by missing `libcublasLt.so.12`.
 
 ### Commands and exact results
 

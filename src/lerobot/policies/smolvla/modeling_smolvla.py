@@ -116,6 +116,17 @@ def atomic_classifier_event_counts(
     }
 
 
+def _weight_implicit_transition_loss(
+    losses: Tensor,
+    target: Tensor,
+    history_ids: Tensor,
+    history_valid: Tensor,
+    switch_weight: float,
+) -> Tensor:
+    switch = history_valid[:, -1] & (target != history_ids[:, -1])
+    return torch.where(switch, losses * switch_weight, losses)
+
+
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
@@ -945,6 +956,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if implicit_transition_logits is not None:
             implicit_transition_losses = F.cross_entropy(
                 implicit_transition_logits, implicit_transition_target, reduction="none"
+            )
+            implicit_transition_losses = _weight_implicit_transition_loss(
+                implicit_transition_losses,
+                implicit_transition_target,
+                transition_history_ids,
+                transition_history_valid,
+                self.config.implicit_transition_switch_weight,
             )
             prediction = implicit_transition_logits.argmax(dim=-1)
             previous_skill = torch.where(
