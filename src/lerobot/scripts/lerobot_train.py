@@ -399,6 +399,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             absolute_to_relative_idx=dataset.absolute_to_relative_idx,
             classifier_event_sampling=getattr(active_cfg, "atomic_classifier_enabled", False),
             anchor_stride=active_cfg.atomic_anchor_stride,
+            transition_horizon=active_cfg.n_action_steps,
         )
         if is_main_process and getattr(active_cfg, "atomic_classifier_enabled", False):
             counts = atomic_sampler.classifier_candidate_counts
@@ -408,8 +409,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             )
         elif is_main_process and active_cfg.atomic_anchor_stride > 1:
             logging.info(
-                "Atomic natural sampler: anchor_stride=%d; retained candidates=%s",
+                "Atomic natural sampler: anchor_stride=%d transition_horizon=%d; retained candidates=%s",
                 active_cfg.atomic_anchor_stride,
+                active_cfg.n_action_steps,
                 atomic_sampler.retained_candidate_counts,
             )
 

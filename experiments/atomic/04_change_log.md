@@ -393,11 +393,15 @@ timeout 15s uv run python -c 'import torch; print(torch.__version__)'
 ## Atomic temporal anchor thinning (2026-08-20)
 
 Added opt-in `atomic_anchor_stride` (default `1`). In natural atomic sampling, values above one retain every
-episode start and mapped-skill boundary, then retain stay anchors at segment-relative stride offsets. The
-requested condition uses stride `5` and `chunk_size=20`; stride `1` preserves the existing `chunk_size=10`
-baseline, while classifier 75:25 sampling ignores the stride.
+no-history anchor in the first `n_action_steps` episode frames and every anchor whose mapped skill differs from
+the skill at `t - n_action_steps`; remaining stays use segment-relative stride offsets. The requested condition
+uses stride `5`, transition horizon `5`, and `chunk_size=20`. Stride `1` preserves the existing all-frame
+`chunk_size=10` baseline, while classifier 75:25 sampling ignores stride and horizon.
 
-Training logs exact retained `start`/`switch`/`stay` counts. Tests cover stride-5 anchors, same-skill subtask
-changes, true boundary direction, deterministic shuffle/resume, baseline compatibility, and classifier
-invariance. Ruff, `py_compile`, and diff checks passed; focused pytest timed out before collection in the local
-CUDA environment.
+### Transition-history alignment correction
+
+The first version retained exact mapped boundaries, but the transition target compares `skill(t)` with
+`skill(t - n_action_steps)`. The sampler now receives that horizon, preserves every matching no-history and
+switch-window anchor within each episode, and thins only model-defined stays. Tests cover exact counts,
+same-skill raw-label changes, cross-episode isolation, deterministic resume, and unchanged classifier sampling.
+Ruff, `py_compile`, and diff checks passed; focused pytest timed out before local CUDA collection.

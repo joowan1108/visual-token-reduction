@@ -590,6 +590,7 @@ def test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly():
             episode_indices_to_use=[0, 2],
             seed=42,
             absolute_to_relative_idx=absolute_to_relative,
+            transition_horizon=5,
         )
 
     sampler = make_sampler()
@@ -605,35 +606,49 @@ def test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly():
 
     with pytest.raises(ValueError, match="exactly cover"):
         AtomicSkillSampler([0], [6], list(range(6)), [0, 1, 2, 3, 4, 5, 0])
+    with pytest.raises(ValueError, match="transition_horizon"):
+        AtomicSkillSampler([0], [6], list(range(6)), list(range(6)), transition_horizon=0)
 
 
 def test_atomic_sampler_thins_stays_from_each_mapped_boundary_and_resumes_exactly():
-    labels = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 6, 6]
+    labels = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 5, 6, 6, 6]
     mapping = [0, 0, 1, 2, 3, 4, 5]
+    episode_starts = (0, 16)
+    episode_ends = (16, 27)
+    transition_horizon = 5
 
     def make_sampler():
         return AtomicSkillSampler(
-            [0, 16],
-            [16, 27],
+            episode_starts,
+            episode_ends,
             subtask_indices=labels,
             subtask_to_skill=mapping,
             seed=42,
             anchor_stride=5,
+            transition_horizon=transition_horizon,
         )
 
     sampler = make_sampler()
-    expected = [0, 5, 8, 13, 15, 16, 21, 22, 23, 24]
+    starts = set(range(5)) | set(range(16, 21))
+    switches = {
+        index
+        for episode_start, episode_end in zip(episode_starts, episode_ends, strict=True)
+        for index in range(episode_start + transition_horizon, episode_end)
+        if mapping[labels[index]] != mapping[labels[index - transition_horizon]]
+    }
+    stays = {5, 13, 21}
+    assert switches == set(range(8, 13)) | set(range(22, 27))
+    expected = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     assert sampler.indices == expected
-    assert sampler.retained_candidate_counts == {"start": 2, "switch": 5, "stay": 3}
-    assert labels[2] != labels[3] and mapping[labels[2]] == mapping[labels[3]]
-    assert 3 not in sampler.indices
-    assert [(mapping[labels[index - 1]], mapping[labels[index]]) for index in (8, 15, 22, 23, 24)] == [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 4),
-        (4, 5),
-    ]
+    assert sampler.retained_candidate_counts == {"start": 10, "switch": 10, "stay": 3}
+    assert switches <= set(sampler.indices)
+    assert stays <= set(sampler.indices)
+    assert labels[5] != labels[6] and mapping[labels[5]] == mapping[labels[6]]
+    assert 6 not in switches and 6 not in sampler.indices
+    assert starts <= set(sampler.indices)
+    assert mapping[labels[15]] != mapping[labels[16]]
+    assert set(range(16, 21)).isdisjoint(switches)
+    assert {6, 7, 14, 15}.isdisjoint(sampler.indices)
 
     first_epoch = list(sampler)
     assert sorted(first_epoch) == expected
@@ -654,7 +669,7 @@ def test_atomic_classifier_sampler_draws_current_boundaries_75_25():
         "classifier_event_sampling": True,
     }
     baseline = AtomicSkillSampler(**kwargs)
-    sampler = AtomicSkillSampler(**kwargs, anchor_stride=99)
+    sampler = AtomicSkillSampler(**kwargs, anchor_stride=99, transition_horizon=5)
     samples = list(sampler)
 
     assert samples == list(baseline)

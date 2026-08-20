@@ -360,9 +360,12 @@ class AtomicSkillSampler(EpisodeAwareSampler):
         absolute_to_relative_idx: dict[int, int] | None = None,
         classifier_event_sampling: bool = False,
         anchor_stride: int = 1,
+        transition_horizon: int = 1,
     ):
         if anchor_stride < 1:
             raise ValueError(f"anchor_stride must be >= 1, got {anchor_stride}")
+        if transition_horizon < 1:
+            raise ValueError(f"transition_horizon must be >= 1, got {transition_horizon}")
         super().__init__(
             dataset_from_indices,
             dataset_to_indices,
@@ -406,6 +409,8 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                 if not 0 <= label < len(mapping):
                     raise ValueError(f"Subtask index {label} is outside the frozen atomic mapping.")
                 skill = int(mapping[label])
+                if previous_skill is not None and skill != previous_skill:
+                    segment_start = absolute_idx
                 if classifier_event_sampling and absolute_idx == start:
                     self._start_candidates.append(relative_idx)
                 elif classifier_event_sampling and skill != previous_skill:
@@ -414,13 +419,20 @@ class AtomicSkillSampler(EpisodeAwareSampler):
                     self._skill_candidates[skill].append(relative_idx)
                 if self._retained_candidates is not None:
                     kind = None
-                    if absolute_idx == start:
+                    history_idx = absolute_idx - transition_horizon
+                    if history_idx < start:
                         kind = "start"
-                    elif skill != previous_skill:
-                        segment_start = absolute_idx
-                        kind = "switch"
-                    elif (absolute_idx - segment_start) % anchor_stride == 0:
-                        kind = "stay"
+                    else:
+                        history_relative_idx = (
+                            history_idx
+                            if absolute_to_relative_idx is None
+                            else absolute_to_relative_idx[history_idx]
+                        )
+                        history_skill = int(mapping[int(labels[history_relative_idx])])
+                        if skill != history_skill:
+                            kind = "switch"
+                        elif (absolute_idx - segment_start) % anchor_stride == 0:
+                            kind = "stay"
                     if kind is not None:
                         self._retained_candidates.append(relative_idx)
                         self._retained_candidate_counts[kind] += 1
