@@ -535,6 +535,12 @@ def test_atomic_classifier_event_counts_exclude_episode_starts():
     }
 
 
+def test_held_out_atomic_metrics_include_implicit_fast_ki():
+    source = (Path(__file__).parents[3] / "src/lerobot/scripts/lerobot_train.py").read_text()
+    assert 'getattr(active_cfg, "implicit_fast_ki_enabled", False)' in source
+    assert source.count("if atomic_eval_metrics_enabled:") == 2
+
+
 def test_atomic_classifier_prefix_prefill_skips_missing_expert_tokens():
     model = VLAFlowMatching.__new__(VLAFlowMatching)
     nn.Module.__init__(model)

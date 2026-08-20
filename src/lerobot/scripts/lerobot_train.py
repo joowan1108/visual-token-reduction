@@ -794,6 +794,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            atomic_eval_metrics_enabled = getattr(active_cfg, "atomic_classifier_enabled", False) or getattr(
+                active_cfg, "implicit_fast_ki_enabled", False
+            )
             atomic_count_keys = (
                 "atomic_stay_correct",
                 "atomic_stay_total",
@@ -811,7 +814,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     loss, eval_output = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
-                    if getattr(active_cfg, "atomic_classifier_enabled", False):
+                    if atomic_eval_metrics_enabled:
                         atomic_counts += torch.tensor(
                             [eval_output[key] for key in atomic_count_keys], device=device
                         )
@@ -824,7 +827,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 eval_metrics = {"eval_loss": eval_loss}
-                if getattr(active_cfg, "atomic_classifier_enabled", False):
+                if atomic_eval_metrics_enabled:
                     stay_correct, stay_total, switch_tp, switch_actual, switch_predicted = atomic_counts
                     eval_metrics.update(
                         {

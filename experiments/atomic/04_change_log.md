@@ -274,6 +274,8 @@ The existing atomic `chunk_size=10`, `n_action_steps`, mapping, and boundary con
   the natural flow/FAST sampler. This is intentionally milder than the prior 75:25 sampler that harmed precision.
 - Scoped Ruff, `py_compile`, and semantic diff checks passed. The focused pytest timed out before collection;
   direct torch import remains blocked by missing `libcublasLt.so.12`.
+- Held-out evaluation now aggregates and logs the existing stay/switch counts for implicit FAST-KI as well as
+  the legacy atomic classifier; metric definitions and training behavior are unchanged.
 
 ### Commands and exact results
 
