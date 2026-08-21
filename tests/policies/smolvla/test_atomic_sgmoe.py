@@ -50,16 +50,14 @@ def test_atomic_config_keeps_dense_defaults_and_freezes_temporal_contract():
     )
     assert config.subtask_delta_indices == list(range(10))
     thinned = SmolVLAConfig(
-        chunk_size=20,
-        n_action_steps=5,
+        chunk_size=10,
+        n_action_steps=10,
         atomic_data_enabled=True,
         atomic_sgmoe_enabled=True,
         atomic_anchor_stride=5,
         atomic_subtask_to_skill=list(range(6)),
     )
-    assert thinned.subtask_delta_indices == list(range(20))
-    with pytest.raises(ValueError, match="chunk_size=20"):
-        replace(thinned, chunk_size=10)
+    assert thinned.subtask_delta_indices == list(range(10))
     with pytest.raises(ValueError, match="load_vlm_weights=True"):
         SmolVLAConfig(
             chunk_size=10,
@@ -201,39 +199,6 @@ def test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage()
     unchanged_context = reasoner(cache, prefix_mask)
     action_targets.add_(1000)
     torch.testing.assert_close(reasoner(cache, prefix_mask), unchanged_context)
-
-    tokenizer = SmolVLAImplicitFastActionTokenizerProcessorStep.__new__(
-        SmolVLAImplicitFastActionTokenizerProcessorStep
-    )
-    tokenizer.atomic_subtask_to_skill = [0, 1]
-    captured_masks = []
-
-    def tokenize(actions, action_is_pad):
-        captured_masks.append(action_is_pad.clone())
-        return torch.ones(1, 3, dtype=torch.long), torch.ones(1, 3, dtype=torch.bool)
-
-    tokenizer._tokenize_action = tokenize
-    tokenized = tokenizer(
-        {
-            TransitionKey.OBSERVATION: {},
-            TransitionKey.ACTION: torch.zeros(1, 4, 2),
-            TransitionKey.REWARD: None,
-            TransitionKey.DONE: None,
-            TransitionKey.TRUNCATED: None,
-            TransitionKey.INFO: None,
-            TransitionKey.COMPLEMENTARY_DATA: {
-                "subtask_index": torch.tensor([[0, 0, 0, 0, 1, 1]]),
-                "subtask_index_is_pad": torch.tensor([[True, True, False, False, False, False]]),
-                "action_is_pad": torch.tensor([[False, False, False, True]]),
-            },
-        }
-    )
-    assert captured_masks[0].tolist() == [[False, False, True, True]]
-    assert tokenized[TransitionKey.COMPLEMENTARY_DATA]["action_is_pad"].tolist() == [
-        [False, False, True, True]
-    ]
-    assert ACTION_TOKENS in tokenized[TransitionKey.COMPLEMENTARY_DATA]
-    assert ACTION_TOKEN_MASK in tokenized[TransitionKey.COMPLEMENTARY_DATA]
 
     class TinyVLMWithExpert(nn.Module):
         def __init__(self):
@@ -401,30 +366,66 @@ def test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage()
     assert flow_model.vlm_with_expert.atomic_router.route.weight.grad is None
 
 
-def test_atomic_boundary_mask_uses_canonical_skill_not_subtask_identity():
+def test_implicit_fast_tokenizer_ignores_pick_place_pick_boundaries():
+    tokenizer = SmolVLAImplicitFastActionTokenizerProcessorStep.__new__(
+        SmolVLAImplicitFastActionTokenizerProcessorStep
+    )
+    tokenizer.atomic_subtask_to_skill = [0, 1]
+    captured_masks = []
+
+    def tokenize(actions, action_is_pad):
+        captured_masks.append(action_is_pad.clone())
+        return torch.ones(1, 3, dtype=torch.long), torch.ones(1, 3, dtype=torch.bool)
+
+    tokenizer._tokenize_action = tokenize
+    tokenized = tokenizer(
+        {
+            TransitionKey.OBSERVATION: {},
+            TransitionKey.ACTION: torch.zeros(1, 4, 2),
+            TransitionKey.REWARD: None,
+            TransitionKey.DONE: None,
+            TransitionKey.TRUNCATED: None,
+            TransitionKey.INFO: None,
+            TransitionKey.COMPLEMENTARY_DATA: {
+                "subtask_index": torch.tensor([[0, 0, 0, 1, 0, 0]]),
+                "subtask_index_is_pad": torch.tensor([[True, True, False, False, False, True]]),
+                "action_is_pad": torch.tensor([[False, False, False, True]]),
+            },
+        }
+    )
+    assert captured_masks[0].tolist() == [[False, False, False, True]]
+    assert not ((~captured_masks[0][:, 1:]) & captured_masks[0][:, :-1]).any()
+    assert tokenized[TransitionKey.COMPLEMENTARY_DATA]["action_is_pad"].tolist() == [
+        [False, False, False, True]
+    ]
+    assert ACTION_TOKENS in tokenized[TransitionKey.COMPLEMENTARY_DATA]
+    assert ACTION_TOKEN_MASK in tokenized[TransitionKey.COMPLEMENTARY_DATA]
+
+
+def test_atomic_action_padding_ignores_pick_place_pick_boundaries():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
-    policy.config = SimpleNamespace(chunk_size=4, atomic_subtask_to_skill=[0, 1, 1, 2, 3, 4, 5])
+    policy.config = SimpleNamespace(chunk_size=4, atomic_subtask_to_skill=list(range(6)))
     skill, action_is_pad = policy._atomic_batch_contract(
         {
-            "subtask_index": torch.tensor([[1, 2, 3, 3]]),
+            "subtask_index": torch.tensor([[0, 1, 0, 0]]),
             "subtask_index_is_pad": torch.tensor([[False, False, False, True]]),
         }
     )
-    assert skill.tolist() == [1]
-    assert action_is_pad.tolist() == [[False, False, True, True]]
+    assert skill.tolist() == [0]
+    assert action_is_pad.tolist() == [[False, False, False, True]]
 
 
 def test_implicit_transition_history_anchors_are_episode_safe_and_reset_per_batch():
     config = SmolVLAConfig(
         chunk_size=10,
-        n_action_steps=5,
+        n_action_steps=10,
         atomic_data_enabled=True,
         atomic_sgmoe_enabled=True,
         implicit_fast_ki_enabled=True,
         atomic_subtask_to_skill=list(range(6)),
         pretrained_path=Path("local-checkpoint"),
     )
-    assert config.subtask_delta_indices == [-10, -5, *range(10)]
+    assert config.subtask_delta_indices == [-20, -10, *range(10)]
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     nn.Module.__init__(policy)
     policy.config = config
@@ -610,12 +611,12 @@ def test_atomic_sampler_shuffles_each_selected_frame_once_and_resumes_exactly():
         AtomicSkillSampler([0], [6], list(range(6)), list(range(6)), transition_horizon=0)
 
 
-def test_atomic_sampler_thins_stays_from_each_mapped_boundary_and_resumes_exactly():
-    labels = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 5, 6, 6, 6]
+def test_atomic_sampler_aligns_ten_step_targets_and_shuffles_deterministically():
+    labels = [*([0] * 11), 1, *([2] * 14), *([3] * 12), 4, 5, *([6] * 12)]
     mapping = [0, 0, 1, 2, 3, 4, 5]
-    episode_starts = (0, 16)
-    episode_ends = (16, 27)
-    transition_horizon = 5
+    episode_starts = (0, 26)
+    episode_ends = (26, 52)
+    transition_horizon = 10
 
     def make_sampler():
         return AtomicSkillSampler(
@@ -629,29 +630,30 @@ def test_atomic_sampler_thins_stays_from_each_mapped_boundary_and_resumes_exactl
         )
 
     sampler = make_sampler()
-    starts = set(range(5)) | set(range(16, 21))
+    starts = set(range(10)) | set(range(26, 36))
     switches = {
         index
         for episode_start, episode_end in zip(episode_starts, episode_ends, strict=True)
         for index in range(episode_start + transition_horizon, episode_end)
         if mapping[labels[index]] != mapping[labels[index - transition_horizon]]
     }
-    stays = {5, 13, 21}
-    assert switches == set(range(8, 13)) | set(range(22, 27))
-    expected = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+    stays = {10, 22, 36, 50}
+    assert switches == set(range(12, 22)) | set(range(38, 50))
+    expected = [index for index in range(52) if index not in {11, 23, 24, 25, 37, 51}]
     assert sampler.indices == expected
-    assert sampler.retained_candidate_counts == {"start": 10, "switch": 10, "stay": 3}
+    assert sampler.retained_candidate_counts == {"start": 20, "switch": 22, "stay": 4}
     assert switches <= set(sampler.indices)
     assert stays <= set(sampler.indices)
-    assert labels[5] != labels[6] and mapping[labels[5]] == mapping[labels[6]]
-    assert 6 not in switches and 6 not in sampler.indices
+    assert labels[10] != labels[11] and mapping[labels[10]] == mapping[labels[11]]
+    assert 11 not in switches and 11 not in sampler.indices
     assert starts <= set(sampler.indices)
-    assert mapping[labels[15]] != mapping[labels[16]]
-    assert set(range(16, 21)).isdisjoint(switches)
-    assert {6, 7, 14, 15}.isdisjoint(sampler.indices)
+    assert mapping[labels[25]] != mapping[labels[26]]
+    assert set(range(26, 36)).isdisjoint(switches)
+    assert {11, 23, 24, 25, 37, 51}.isdisjoint(sampler.indices)
 
     first_epoch = list(sampler)
     assert sorted(first_epoch) == expected
+    assert first_epoch != expected
     assert first_epoch == list(make_sampler())
     resumed = make_sampler()
     resumed.load_state_dict({"epoch": 0, "start_index": 4})

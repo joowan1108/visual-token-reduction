@@ -61,8 +61,7 @@ class SmolVLAImplicitFastActionTokenizerProcessorStep(ActionTokenizerProcessorSt
         valid = ~labels_is_pad.bool()
         if ((labels[valid] < 0) | (labels[valid] >= mapping.numel())).any():
             raise ValueError("Atomic subtask index is outside the frozen mapping vocabulary.")
-        skills = mapping[labels.long().clamp(0, mapping.numel() - 1)]
-        action_is_pad = labels_is_pad.bool() | (skills != skills[:, :1])
+        action_is_pad = labels_is_pad.bool()
         existing = complementary.get("action_is_pad")
         if existing is not None:
             action_is_pad |= existing.bool()

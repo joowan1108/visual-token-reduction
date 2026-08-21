@@ -395,8 +395,8 @@ timeout 15s uv run python -c 'import torch; print(torch.__version__)'
 Added opt-in `atomic_anchor_stride` (default `1`). In natural atomic sampling, values above one retain every
 no-history anchor in the first `n_action_steps` episode frames and every anchor whose mapped skill differs from
 the skill at `t - n_action_steps`; remaining stays use segment-relative stride offsets. The requested condition
-uses stride `5`, transition horizon `5`, and `chunk_size=20`. Stride `1` preserves the existing all-frame
-`chunk_size=10` baseline, while classifier 75:25 sampling ignores stride and horizon.
+original thinning condition used stride `5`, transition horizon `5`, and `chunk_size=20`. Stride `1` preserves
+the existing all-frame `chunk_size=10` baseline, while classifier 75:25 sampling ignores stride and horizon.
 
 ### Transition-history alignment correction
 
@@ -405,3 +405,42 @@ The first version retained exact mapped boundaries, but the transition target co
 switch-window anchor within each episode, and thins only model-defined stays. Tests cover exact counts,
 same-skill raw-label changes, cross-episode isolation, deterministic resume, and unchanged classifier sampling.
 Ruff, `py_compile`, and diff checks passed; focused pytest timed out before local CUDA collection.
+
+## AtomicVLA-aligned unmasked chunks (2026-08-21)
+
+Results inspected: none. This user-approved correction supersedes atomic skill-boundary action masking and the
+earlier 5-step/20-frame thinning condition. Metrics, datasets, seeds, and evaluation criteria are unchanged.
+
+### Changed files and configuration
+
+- `src/lerobot/policies/smolvla/processor_smolvla.py`: FAST tokenization now combines only true subtask/episode
+  padding with existing action padding; skill changes no longer enter its mask.
+- `src/lerobot/policies/smolvla/modeling_smolvla.py`: atomic flow loss now uses only episode/action padding while
+  retaining the anchor skill for SG-MoE routing.
+- `src/lerobot/policies/smolvla/configuration_smolvla.py`: atomic thinning supports `chunk_size=10` and
+  `n_action_steps=10`; the global SmolVLA defaults remain unchanged.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`: added focused pick/place/pick FAST and flow-padding regressions,
+  `t-10` history/target coverage, and deterministically shuffled stride-5 sampler coverage. Existing config
+  propagation already passes `n_action_steps` as the sampler transition horizon.
+
+### Commands and results
+
+```bash
+.venv/bin/ruff format <the four modified Python files>
+# 4 files left unchanged.
+.venv/bin/ruff check --ignore SIM102,E402 <the four modified Python files>
+# All checks passed!
+/usr/bin/python3 -m py_compile <the four modified Python files>
+# Passed.
+timeout 45s uv run pytest <the six focused atomic tests> -q --tb=short
+# Stopped during pytest plugin metadata discovery before collection (exit 130); no tests ran.
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 25s uv run pytest <the same six tests> -q --tb=short
+# Timed out before emitting collection output (exit 124); no tests ran.
+git diff --check --ignore-space-at-eol -- <the five intervention files>
+# Passed.
+```
+
+Only boundary-derived padding and the superseded temporal condition changed. FAST still rejects malformed
+non-suffix episode padding, classifier 75:25 behavior is unchanged, and stride `1` retains its exact baseline
+sampling path. This is an AtomicVLA-aligned adaptation, not a claim of reproducing the paper's think windows.
+No training/evaluation run, dependency change, result interpretation, commit, or push was performed.

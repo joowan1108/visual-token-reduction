@@ -223,14 +223,8 @@ class SmolVLAConfig(PreTrainedConfig):
         ):
             raise ValueError("`atomic_anchor_stride` must be an integer >= 1.")
         if self.atomic_data_enabled:
-            if self.atomic_anchor_stride == 1 and (
-                self.chunk_size != 10 or not 0 < self.n_action_steps <= 10
-            ):
+            if self.chunk_size != 10 or not 0 < self.n_action_steps <= 10:
                 raise ValueError("Atomic experiments require chunk_size=10 and 1 <= n_action_steps <= 10.")
-            if self.atomic_anchor_stride > 1 and (self.chunk_size != 20 or not 0 < self.n_action_steps <= 20):
-                raise ValueError(
-                    "Atomic anchor thinning requires chunk_size=20 and 1 <= n_action_steps <= 20."
-                )
             if self.atomic_subtask_to_skill is None and self.atomic_subtask_to_skill_path is None:
                 raise ValueError(
                     "`atomic_subtask_to_skill` or `atomic_subtask_to_skill_path` is required when atomic data handling is enabled."

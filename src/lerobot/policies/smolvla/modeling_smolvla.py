@@ -596,8 +596,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         skills = skills[:, anchor:]
         labels_is_pad = labels_is_pad[:, anchor:].bool()
         current_skill = skills[:, 0]
-        boundary_is_pad = labels_is_pad | (skills != current_skill[:, None])
-        return current_skill, boundary_is_pad
+        return current_skill, labels_is_pad
 
     def _atomic_classifier_targets(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         current_skill, _ = self._atomic_batch_contract(batch)
@@ -892,9 +891,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         transition_history_ids = None
         transition_history_valid = None
         if self.config.atomic_data_enabled:
-            atomic_skill_id, boundary_is_pad = self._atomic_batch_contract(batch)
+            atomic_skill_id, atomic_action_is_pad = self._atomic_batch_contract(batch)
             actions_is_pad = (
-                boundary_is_pad if actions_is_pad is None else actions_is_pad.bool() | boundary_is_pad
+                atomic_action_is_pad
+                if actions_is_pad is None
+                else actions_is_pad.bool() | atomic_action_is_pad
             )
             if self._implicit_transition_enabled():
                 (
