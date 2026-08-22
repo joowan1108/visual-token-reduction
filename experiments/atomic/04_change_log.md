@@ -681,3 +681,68 @@ timeout 45s uv run pytest \
   -q --tb=short
 # Collection failed before the test ran: ImportError: libcublasLt.so.12 was unavailable (exit 4).
 ```
+
+## Implicit FAST-KI predicted training routing correction (2026-08-22)
+
+Results inspected: none. No metric, dataset, split, seed, budget, statistical test, or evaluation criterion
+was changed.
+
+### Changed files and configuration
+
+- `src/lerobot/policies/smolvla/modeling_smolvla.py`: implicit training computes supervised transition logits
+  first and routes SG-MoE action flow with their top-1 skill prediction. The transition focal/CE objective is
+  unchanged; integer `argmax` does not pass flow gradients into the transition head. Added a runtime-only
+  `force_gt_atomic_skill_routing` argument for the offline diagnostic.
+- `experiments/atomic/eval_gt_routed_action_loss.py`: explicitly sets the runtime override so implicit
+  checkpoints remain dataset-GT-routed during this offline action-loss diagnostic.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`: added a focused regression proving transition logits precede
+  routing, normal training uses predicted IDs, the override uses different dataset IDs, and the evaluator opts
+  into that override.
+- `experiments/atomic/04_change_log.md`: recorded this correction.
+
+No persistent configuration field or dependency was added. `implicit_fast_ki_enabled=false` retains baseline
+behavior; non-implicit atomic training and the existing closed-loop explicit `atomic_skill_id` inference
+override are unchanged.
+
+### Commands and exact results
+
+```bash
+.venv/bin/ruff format --check src/lerobot/policies/smolvla/modeling_smolvla.py \
+  experiments/atomic/eval_gt_routed_action_loss.py tests/policies/smolvla/test_atomic_sgmoe.py
+# Initially reported one test tensor literal that would be reformatted; after applying that exact layout:
+# 3 files already formatted
+
+.venv/bin/ruff check --ignore SIM102 src/lerobot/policies/smolvla/modeling_smolvla.py \
+  experiments/atomic/eval_gt_routed_action_loss.py tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed!
+
+/usr/bin/python3 -m py_compile src/lerobot/policies/smolvla/modeling_smolvla.py \
+  experiments/atomic/eval_gt_routed_action_loss.py tests/policies/smolvla/test_atomic_sgmoe.py
+# Passed.
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 55s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_training_routes_predicted_skill_and_gt_eval_can_force_dataset_skill \
+  -q --tb=short
+# Timed out during local environment startup without collection output (exit 124); no test result was produced.
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 30s .venv/bin/pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_implicit_training_routes_predicted_skill_and_gt_eval_can_force_dataset_skill \
+  -q --tb=short
+# Also timed out before collection output (exit 124); bypassing `uv run` did not change the blocker.
+
+git diff --check --ignore-space-at-eol -- src/lerobot/policies/smolvla/modeling_smolvla.py \
+  experiments/atomic/eval_gt_routed_action_loss.py tests/policies/smolvla/test_atomic_sgmoe.py \
+  experiments/atomic/04_change_log.md
+# Passed.
+```
+
+### Assumptions and deviations from the paper
+
+- This user-directed correction supersedes Amendment 05's statement that the current dataset skill is the
+  implicit flow-routing target. Dataset labels remain the transition target and are used for action routing
+  only by the named offline GT diagnostic.
+- Top-1 predicted routing is intentionally nondifferentiable. The transition head remains trained solely by
+  its preregistered supervised focal/CE term; no straight-through estimator or soft routing was added.
+- This remains a KI-style SmolVLA adaptation rather than an exact AtomicVLA reproduction. No training,
+  checkpoint evaluation, rollout, raw-result mutation, result interpretation, dependency change, commit, or
+  push was performed.

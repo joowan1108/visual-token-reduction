@@ -859,6 +859,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         time=None,
         reduction: str = "mean",
         return_loss_components: bool = False,
+        force_gt_atomic_skill_routing: bool = False,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss.
 
@@ -871,6 +872,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
             return_loss_components: Include detached per-sample flow/auxiliary diagnostics. This is
                 only valid with ``reduction="none"`` and is disabled for training logs by default.
+            force_gt_atomic_skill_routing: Keep dataset skill routing for the offline GT diagnostic.
         """
         if return_loss_components and reduction != "none":
             raise ValueError("Per-sample loss components require reduction='none'.")
@@ -945,6 +947,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             fast_action_masks=batch.get(ACTION_TOKEN_MASK),
             transition_history_ids=transition_history_ids,
             transition_history_valid=transition_history_valid,
+            force_gt_atomic_skill_routing=force_gt_atomic_skill_routing,
         )
         auxiliary_logits = None
         fast_losses = None
@@ -1870,6 +1873,7 @@ class VLAFlowMatching(nn.Module):
         fast_action_masks=None,
         transition_history_ids=None,
         transition_history_valid=None,
+        force_gt_atomic_skill_routing=False,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1915,6 +1919,8 @@ class VLAFlowMatching(nn.Module):
             implicit_transition_logits = self._implicit_transition_logits(
                 fused_context, transition_history_ids, transition_history_valid
             )
+            if not force_gt_atomic_skill_routing:
+                atomic_skill_id = implicit_transition_logits.argmax(dim=-1)
             prefix_out = None
             suffix_out = self._forward_implicit_action(
                 fused_context,

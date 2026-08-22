@@ -174,7 +174,10 @@ def main() -> None:
                 with torch.random.fork_rng(devices=rng_devices):
                     torch.manual_seed(_flow_repeat_seed(args.seed, batch_index, repeat_index))
                     repeat_loss, diagnostics = policy.forward(
-                        batch, reduction="none", return_loss_components=True
+                        batch,
+                        reduction="none",
+                        return_loss_components=True,
+                        force_gt_atomic_skill_routing=True,
                     )
                 flow_loss = diagnostics.get("flow_loss_per_sample", repeat_loss)
                 sample_loss += flow_loss.float() / args.noise_repeats

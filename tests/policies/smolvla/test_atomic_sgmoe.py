@@ -679,6 +679,71 @@ def test_implicit_transition_focal_loss_and_validation():
     assert "_implicit_transition_focal_loss" in inspect.getsource(SmolVLAPolicy.forward)
 
 
+def test_implicit_training_routes_predicted_skill_and_gt_eval_can_force_dataset_skill():
+    model = VLAFlowMatching.__new__(VLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        implicit_fast_ki_enabled=True,
+        skill_linking_enabled=False,
+        phase_camera_masking_enabled=False,
+        chunk_size=1,
+    )
+    model.action_out_proj = nn.Identity()
+    model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
+    model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 1, 1),
+        torch.ones(2, 1, dtype=torch.bool),
+        torch.ones(2, 1, dtype=torch.bool),
+        (),
+        (0, 1),
+    )
+    model.embed_suffix = lambda *args, **kwargs: (
+        torch.zeros(2, 1, 1),
+        torch.ones(2, 1, dtype=torch.bool),
+        torch.ones(2, 1, dtype=torch.bool),
+    )
+    model.vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: (None, object()))
+    model._implicit_context = lambda *args: torch.zeros(2, 1, 1)
+    model._fused_implicit_context = lambda context, state: context
+    model._fast_losses = lambda *args: torch.zeros(2)
+    transition_logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])
+    events = []
+
+    def transition(*args):
+        events.append("transition")
+        return transition_logits
+
+    def action(*args):
+        events.append(args[-1].clone())
+        return torch.zeros(2, 1, 1)
+
+    model._implicit_transition_logits = transition
+    model._forward_implicit_action = action
+    inputs = ([], [], torch.zeros(2, 1), torch.ones(2, 1), torch.zeros(2, 1), torch.zeros(2, 1, 1))
+    kwargs = {
+        "atomic_skill_id": torch.tensor([1, 3]),
+        "fast_action_tokens": torch.zeros(2, 1, dtype=torch.long),
+        "fast_action_masks": torch.ones(2, 1, dtype=torch.bool),
+        "transition_history_ids": torch.zeros(2, 2, dtype=torch.long),
+        "transition_history_valid": torch.zeros(2, 2, dtype=torch.bool),
+    }
+
+    model.forward(*inputs, **kwargs)
+    assert events[0] == "transition"
+    assert events[1].tolist() == [4, 2]
+
+    events.clear()
+    model.forward(*inputs, **kwargs, force_gt_atomic_skill_routing=True)
+    assert events[0] == "transition"
+    assert events[1].tolist() == [1, 3]
+    assert "force_gt_atomic_skill_routing=force_gt_atomic_skill_routing" in inspect.getsource(
+        SmolVLAPolicy.forward
+    )
+    evaluator = (Path(__file__).parents[3] / "experiments/atomic/eval_gt_routed_action_loss.py").read_text()
+    assert "force_gt_atomic_skill_routing=True" in evaluator
+
+
 def test_atomic_classifier_uses_previous_and_current_frame_labels():
     policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
     policy.config = SimpleNamespace(
