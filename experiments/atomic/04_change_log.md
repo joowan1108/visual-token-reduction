@@ -548,3 +548,136 @@ uv run python -m py_compile <the same four Python files>
 ```
 
 No pytest, training, checkpoint evaluation, dependency change, commit, or push was performed.
+
+## IAR searchable-query model-view heatmaps (2026-08-22)
+
+Results inspected: none. This is an opt-in visualization diagnostic only. Numeric IAR diagnostics, dataset
+revision/split, seed, sample selection, metrics, and evaluation criteria are unchanged; the disabled default
+retains the previous evaluator behavior.
+
+### Changed files and configuration
+
+- `experiments/atomic/eval_iar_diagnostics.py`
+  - Added `--heatmap-samples` with default `0` and `--heatmap-dir` with default
+    `outputs/eval/atomic_iar_heatmaps`; values outside `0..max_samples` fail before loading the checkpoint.
+  - For only the first requested samples, obtains the actual normalized/resized model-view tensors from
+    `policy.prepare_images(batch)`, converts `[-1,1]` to uint8, and saves one compressed NPZ per selected IAR
+    layer/query/sample. Full-prefix attention is sliced by the captured camera token spans without visual-only
+    renormalization, so `attention_maps` and `attention_mass` preserve the true probabilities and camera mass.
+  - Reuses the existing renderer keys and shape contract. Added metadata identifies
+    `iar_searchable_query`, layer, query, camera keys, sampled dataset/episode/frame identity, task, and GT skill.
+    Filenames carry sample identity, skill, layer, and query; existing files are never overwritten.
+  - Requires equal square visual-token grids and raises the existing renderer error for nonsquare grids.
+    Images and raw capture live for one batch only; `max_samples=256 --heatmap-samples=4` saves exactly four
+    samples, producing `4 * selected_layers * selected_queries` NPZ files.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`
+  - Added one two-camera small-tensor/temp-directory check for bounded first-sample saving, exact raw map/mass,
+    uint8 model-view conversion, IAR/sample/skill metadata, and compatibility with
+    `render_attention_maps()`.
+- `experiments/atomic/04_change_log.md`
+  - Recorded scope, configuration, commands, assumptions, and paper deviations for this intervention.
+
+No model/config schema, renderer, dependency, checkpoint, raw result, or `smolvlm_with_expert.py` change was
+made. `--heatmap-samples=0` performs no extra image preparation and writes no heatmap directory or JSON section.
+
+### Usage
+
+```bash
+uv run python experiments/atomic/eval_iar_diagnostics.py \
+  --policy-path outputs/train/atomic-implicit/checkpoints/last/pretrained_model \
+  --max-samples 256 --heatmap-samples 4 \
+  --heatmap-dir outputs/eval/atomic_iar_heatmaps \
+  --output outputs/eval/atomic_iar_diagnostics.json
+
+uv run python -m lerobot.scripts.visualize_smolvla_attention \
+  outputs/eval/atomic_iar_heatmaps \
+  --output-dir outputs/eval/atomic_iar_overlays
+```
+
+Omitting `--layers` and `--queries` saves all configured IAR layers/queries for those four samples. Supplying
+either option limits both numeric capture and heatmap output using the evaluator's existing selection rules.
+
+### Commands and exact results
+
+```bash
+.venv/bin/ruff check experiments/atomic/eval_iar_diagnostics.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed!
+
+uv run ruff format --check experiments/atomic/eval_iar_diagnostics.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# 2 files already formatted
+
+/usr/bin/python3 -m py_compile experiments/atomic/eval_iar_diagnostics.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# Passed.
+
+timeout 60s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_iar_heatmaps_preserve_query_attention_metadata_and_renderer_contract \
+  -q --tb=short
+# Collection failed before the test ran: ImportError: libcublasLt.so.12 was unavailable (exit 4).
+
+git diff --check --ignore-space-at-eol -- experiments/atomic/eval_iar_diagnostics.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py experiments/atomic/04_change_log.md
+# Passed.
+```
+
+### Assumptions and deviations from the paper
+
+- Captured visual-token spans and `prepare_images()` camera order originate from the same model prefix path;
+  saved `camera_keys` records that order. Missing configured cameras retain the model's padded view/mask behavior.
+- `flow_step=-1` is retained solely for compatibility with the existing NPZ renderer and is explicitly marked
+  `flow_step_semantics=not_applicable`; these maps are IAR searchable-query attention, not action-expert
+  self/cross-attention.
+- This visualization is not an AtomicVLA paper component and makes no method/performance claim. It stores only
+  bounded visual slices for audit/rerendering, never full language/other-token attention or all evaluated samples.
+- No training, evaluation run, result interpretation, dependency repair, commit, or push was performed.
+
+Suggested Git staging list (not executed):
+
+```bash
+git add experiments/atomic/eval_iar_diagnostics.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py experiments/atomic/04_change_log.md
+```
+
+### Renderer truthfulness correction (2026-08-22)
+
+Results inspected: none. Attention values, camera mass, spatial normalization, evaluator behavior, metrics,
+dataset, seed, and evaluation criteria are unchanged.
+
+- `src/lerobot/scripts/visualize_smolvla_attention.py` now reads optional `camera_keys` and `queries`; legacy
+  NPZ files fall back to camera indices and `query=<unknown>`. Every overlay label includes attention kind/scope,
+  camera key, query, layer, flow step, raw camera mass, the actual shared raw visual peak, and
+  `normalization=relative_spatial_peak`. The existing shared per-sample visual-peak normalization is unchanged.
+- `tests/policies/smolvla/test_atomic_sgmoe.py` strengthens the focused IAR NPZ/renderer test with a single
+  top-right peak in an asymmetric 2x2 map. It asserts the rendered top-right is hot and bottom-left is cold, so
+  a transpose/flip fails, and captures the rendered label to assert camera/query/layer/mass/raw-peak/relative
+  normalization metadata.
+- `experiments/atomic/04_change_log.md` records this correction and verification.
+
+No evaluator, model, dependency, NPZ schema, renderer replacement, training, result interpretation, commit, or
+push was performed. The displayed `raw_visual_peak` is the shared maximum across all camera maps for that sample,
+exactly matching the denominator used for relative spatial comparison; per-camera `mass` remains the unnormalized
+sum of raw visual attention.
+
+```bash
+.venv/bin/ruff check src/lerobot/scripts/visualize_smolvla_attention.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed!
+
+/usr/bin/python3 -m py_compile src/lerobot/scripts/visualize_smolvla_attention.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py
+# Passed.
+
+git diff --check --ignore-space-at-eol -- src/lerobot/scripts/visualize_smolvla_attention.py \
+  tests/policies/smolvla/test_atomic_sgmoe.py experiments/atomic/04_change_log.md
+# Passed.
+
+git diff --no-index --check /dev/null src/lerobot/scripts/visualize_smolvla_attention.py; test $? -le 1
+# Passed; the pre-existing renderer file is untracked, so the ordinary targeted Git diff omits it.
+
+timeout 45s uv run pytest \
+  tests/policies/smolvla/test_atomic_sgmoe.py::test_iar_heatmaps_preserve_spatial_orientation_and_truthful_metadata \
+  -q --tb=short
+# Collection failed before the test ran: ImportError: libcublasLt.so.12 was unavailable (exit 4).
+```

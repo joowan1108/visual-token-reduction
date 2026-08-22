@@ -3,14 +3,17 @@
 """Summarize implicit FAST-KI IAR attention on a dataset-factory validation subset.
 
 Diversity is normalized Jensen-Shannon divergence: 0 means identical attention and 1 means
-maximally different attention. Raw token attention is consumed one batch at a time and is not saved.
+maximally different attention. Full raw token attention is consumed one batch at a time; optional
+heatmaps retain only bounded visual-token slices.
 """
 
 import argparse
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
@@ -56,6 +59,105 @@ def _group_mean_jsd(
     return normalized_jsd(left, right).item()
 
 
+def _save_iar_heatmaps(
+    output_dir: Path,
+    capture: dict,
+    images: list[torch.Tensor],
+    camera_keys: list[str],
+    batch: dict,
+    skill_ids: torch.Tensor,
+    dataset_indices: list[int],
+    sample_offset: int,
+) -> list[Path]:
+    """Save raw IAR visual slices in the existing attention-overlay NPZ format."""
+    attention = capture["attention"].detach().float().cpu()
+    spans = capture["visual_token_spans"]
+    if attention.ndim != 4:
+        raise ValueError("IAR attention must be [batch, layer, query, token].")
+    if len(images) != len(spans) or len(camera_keys) != len(spans):
+        raise ValueError("IAR images, camera keys, and visual-token spans must align.")
+    token_counts = {end - start for start, end in spans}
+    if len(token_counts) != 1:
+        raise ValueError("IAR heatmap cameras must have the same visual-token count.")
+    token_count = token_counts.pop()
+    grid_size = math.isqrt(token_count)
+    if grid_size * grid_size != token_count:
+        raise ValueError(f"Expected a square visual-token grid, got {token_count} values.")
+
+    sample_count = len(dataset_indices)
+    stacked_images = torch.stack(images, dim=1)
+    if not 0 < sample_count <= attention.shape[0] or stacked_images.shape[0] != attention.shape[0]:
+        raise ValueError("Requested IAR heatmap samples must fit the captured image batch.")
+    image_array = (
+        ((stacked_images[:sample_count].detach().float().cpu() + 1) * 127.5)
+        .round()
+        .clamp(0, 255)
+        .to(torch.uint8)
+        .permute(0, 1, 3, 4, 2)
+        .numpy()
+    )
+
+    tasks = batch.get("task", [""] * attention.shape[0])
+    tasks = [tasks] if isinstance(tasks, str) else list(tasks)
+    if len(tasks) < sample_count or not all(isinstance(task, str) for task in tasks[:sample_count]):
+        raise ValueError("Task descriptions must be one string per IAR heatmap sample.")
+
+    def batch_ids(key: str) -> list[int]:
+        values = batch.get(key)
+        if values is None:
+            return [-1] * sample_count
+        values = torch.as_tensor(values).detach().cpu().reshape(attention.shape[0], -1)
+        return [int(value) for value in values[:sample_count, 0]]
+
+    episode_indices = batch_ids("episode_index")
+    frame_indices = batch_ids("frame_index")
+    skill_ids = skill_ids.detach().cpu().reshape(-1)[:sample_count]
+    layers = tuple(capture["layers"])
+    queries = tuple(capture["queries"])
+    if attention.shape[1:3] != (len(layers), len(queries)):
+        raise ValueError("IAR attention must align with captured layers and queries.")
+
+    outputs = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for batch_index in range(sample_count):
+        skill_id = int(skill_ids[batch_index])
+        skill = ATOMIC_SKILLS[skill_id]
+        identity = (
+            f"sample_{sample_offset + batch_index:04d}_index_{dataset_indices[batch_index]}_"
+            f"episode_{episode_indices[batch_index]}_frame_{frame_indices[batch_index]}"
+        )
+        for layer_index, layer in enumerate(layers):
+            for query_index, query in enumerate(queries):
+                output = output_dir / f"{identity}_skill_{skill}_iar_layer_{layer}_query_{query}.npz"
+                if output.exists():
+                    raise FileExistsError(f"Refusing to overwrite IAR heatmap: {output}")
+                token_attention = attention[batch_index, layer_index, query_index]
+                maps = np.stack([token_attention[start:end].numpy() for start, end in spans])[None]
+                np.savez_compressed(
+                    output,
+                    images=image_array[batch_index : batch_index + 1],
+                    task_descriptions=np.asarray([tasks[batch_index]], dtype=np.str_),
+                    attention_maps=maps,
+                    attention_mass=maps.sum(axis=-1),
+                    layers=np.asarray([layer], dtype=np.int64),
+                    queries=np.asarray([query], dtype=np.int64),
+                    flow_step=np.asarray(-1, dtype=np.int64),
+                    flow_step_semantics=np.asarray("not_applicable"),
+                    attention_kind=np.asarray("iar_searchable_query"),
+                    attention_scope=np.asarray("full_prefix_visual_slice"),
+                    attention_source=np.asarray("implicit_action_reasoner"),
+                    camera_keys=np.asarray(camera_keys, dtype=np.str_),
+                    sample_identities=np.asarray([identity], dtype=np.str_),
+                    dataset_indices=np.asarray([dataset_indices[batch_index]], dtype=np.int64),
+                    episode_indices=np.asarray([episode_indices[batch_index]], dtype=np.int64),
+                    frame_indices=np.asarray([frame_indices[batch_index]], dtype=np.int64),
+                    skill_ids=np.asarray([skill_id], dtype=np.int64),
+                    skill_names=np.asarray([skill], dtype=np.str_),
+                )
+                outputs.append(output)
+    return outputs
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Dataset-factory validation-split implicit IAR attention diagnostics."
@@ -69,6 +171,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--layers", type=int, nargs="+", help="Actual selected VLM layer indices.")
     parser.add_argument("--queries", type=int, nargs="+", help="Zero-based IAR query indices.")
+    parser.add_argument("--heatmap-samples", type=int, default=0)
+    parser.add_argument("--heatmap-dir", default="outputs/eval/atomic_iar_heatmaps")
     parser.add_argument("--dataset-repo-id", default="k1000dai/libero_subtask_sarm")
     parser.add_argument("--dataset-revision", default="8ec70343c56430f5dbae09af6b073d879207fe7c")
     parser.add_argument("--eval-split", type=float, default=0.1)
@@ -79,6 +183,8 @@ def main() -> None:
     args = _parse_args()
     if args.max_samples <= 0 or args.batch_size <= 0 or args.workers < 0:
         raise ValueError("max_samples and batch_size must be positive; workers must be non-negative.")
+    if not 0 <= args.heatmap_samples <= args.max_samples:
+        raise ValueError("heatmap_samples must be non-negative and no greater than max_samples.")
     output = Path(args.output)
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite IAR diagnostics: {output}")
@@ -131,6 +237,8 @@ def main() -> None:
 
     collected: dict[str, list[torch.Tensor]] = {}
     skill_ids_all = []
+    heatmap_samples_saved = 0
+    heatmap_files_saved = 0
     layers = queries = None
     try:
         with torch.inference_mode():
@@ -140,6 +248,13 @@ def main() -> None:
                         batch[camera_key] = batch[camera_key].float() / 255.0
                 batch = preprocessor(batch)
                 skill_ids, _ = policy._atomic_batch_contract(batch)
+                heatmap_batch_size = min(args.heatmap_samples - heatmap_samples_saved, skill_ids.shape[0])
+                heatmap_images = camera_keys = None
+                if heatmap_batch_size:
+                    heatmap_images, _ = policy.prepare_images(batch)
+                    present_keys = [key for key in policy.config.image_features if key in batch]
+                    missing_keys = [key for key in policy.config.image_features if key not in batch]
+                    camera_keys = present_keys + missing_keys[: len(heatmap_images) - len(present_keys)]
                 state_context = policy.model.state_proj(policy.prepare_state(batch))
                 policy.forward(batch, reduction="none")
                 captures = reasoner.pop_diagnostics()
@@ -147,6 +262,19 @@ def main() -> None:
                     raise RuntimeError("Expected exactly one IAR capture per policy forward.")
                 capture = captures[0]
                 layers, queries = capture["layers"], capture["queries"]
+                if heatmap_batch_size:
+                    outputs = _save_iar_heatmaps(
+                        Path(args.heatmap_dir),
+                        capture,
+                        heatmap_images,
+                        camera_keys,
+                        batch,
+                        skill_ids,
+                        indices[heatmap_samples_saved : heatmap_samples_saved + heatmap_batch_size],
+                        heatmap_samples_saved,
+                    )
+                    heatmap_samples_saved += heatmap_batch_size
+                    heatmap_files_saved += len(outputs)
                 metrics = iar_capture_metrics(capture, state_context)
                 for name, values in metrics.items():
                     collected.setdefault(name, []).append(values)
@@ -247,6 +375,14 @@ def main() -> None:
         "per_skill": per_skill,
         "skill_attention_differences": skill_differences,
     }
+    if args.heatmap_samples:
+        result["iar_heatmaps"] = {
+            "sample_count": heatmap_samples_saved,
+            "file_count": heatmap_files_saved,
+            "directory": str(Path(args.heatmap_dir)),
+            "attention_kind": "iar_searchable_query",
+            "scope": "full_prefix_visual_slice",
+        }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n")
 

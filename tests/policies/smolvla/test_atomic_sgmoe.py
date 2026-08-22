@@ -5,11 +5,14 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image, ImageDraw
 from torch import nn
 
 import lerobot.policies.smolvla.smolvlm_with_expert as smolvlm_with_expert
+from experiments.atomic.eval_iar_diagnostics import _save_iar_heatmaps
 from lerobot.datasets.sampler import AtomicSkillSampler
 from lerobot.lerobot_types import TransitionKey
 from lerobot.policies.smolvla.attention_analysis import iar_capture_metrics, normalized_jsd
@@ -33,6 +36,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
     ImplicitActionReasoner,
     SmolVLMWithExpertModel,
 )
+from lerobot.scripts.visualize_smolvla_attention import render_attention_maps
 from lerobot.utils.constants import ACTION, ACTION_TOKEN_MASK, ACTION_TOKENS, OBS_STATE
 
 
@@ -724,6 +728,70 @@ def test_atomic_diagnostic_scripts_freeze_validation_provenance_and_flow_rng():
     assert "dataset_factory_validation_split" in iar_source
     assert "sample_pair_count" not in iar_source
     assert '"comparison": "group_mean_vs_group_mean"' in iar_source
+
+
+def test_iar_heatmaps_preserve_spatial_orientation_and_truthful_metadata(tmp_path, monkeypatch):
+    capture = {
+        "attention": torch.tensor(
+            [
+                [[[0.0, 0.4, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5]]],
+                [[[0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01, 0.64]]],
+            ]
+        ),
+        "layers": (9,),
+        "queries": (2,),
+        "visual_token_spans": ((0, 4), (4, 8)),
+    }
+    images = [torch.full((2, 3, 2, 2), -1.0), torch.full((2, 3, 2, 2), 1.0)]
+    outputs = _save_iar_heatmaps(
+        tmp_path / "maps",
+        capture,
+        images,
+        ["observation.images.image", "observation.images.image2"],
+        {
+            "task": ["pick up the bowl", "place the bowl"],
+            "episode_index": torch.tensor([3, 4]),
+            "frame_index": torch.tensor([12, 13]),
+        },
+        torch.tensor([0, 1]),
+        [101],
+        0,
+    )
+
+    assert len(outputs) == 1
+    with np.load(outputs[0], allow_pickle=False) as data:
+        assert data["images"].shape == (1, 2, 2, 2, 3)
+        assert data["images"][0, :, 0, 0, 0].tolist() == [0, 255]
+        assert data["attention_maps"].shape == (1, 2, 4)
+        np.testing.assert_allclose(data["attention_maps"][0, 0], [0.0, 0.4, 0.0, 0.0])
+        np.testing.assert_allclose(data["attention_mass"], [[0.4, 0.1]])
+        assert str(data["attention_kind"]) == "iar_searchable_query"
+        assert data["layers"].tolist() == [9]
+        assert data["queries"].tolist() == [2]
+        assert data["dataset_indices"].tolist() == [101]
+        assert data["episode_indices"].tolist() == [3]
+        assert data["frame_indices"].tolist() == [12]
+        assert data["skill_names"].tolist() == ["pick"]
+
+    labels = []
+    original_multiline_text = ImageDraw.ImageDraw.multiline_text
+
+    def record_multiline_text(draw, position, text, *args, **kwargs):
+        labels.append(text)
+        return original_multiline_text(draw, position, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "multiline_text", record_multiline_text)
+    assert render_attention_maps(outputs[0], tmp_path / "overlays") == 1
+    assert any(
+        "camera=observation.images.image query=2 layer=9" in label
+        and "mass=0.4 raw_visual_peak=0.4 normalization=relative_spatial_peak" in label
+        for label in labels
+    )
+    with Image.open(next((tmp_path / "overlays").glob("*.png"))) as overlay:
+        rendered = np.asarray(overlay)
+    heatmap = rendered[90:92, 0:2]
+    assert heatmap[0, 1, 0] > heatmap[0, 1, 2]
+    assert heatmap[1, 0, 2] > heatmap[1, 0, 0]
 
 
 def test_atomic_classifier_prefix_prefill_skips_missing_expert_tokens():
