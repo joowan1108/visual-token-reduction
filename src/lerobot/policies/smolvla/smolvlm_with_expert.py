@@ -293,14 +293,44 @@ class ImplicitActionReasoner(nn.Module):
                 nn.init.normal_(parameter, std=0.02)
             else:
                 nn.init.zeros_(parameter)
+        self._diagnostic_selection: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._diagnostic_max_batches = 1
+        self._diagnostic_batches: list[dict] = []
 
-    def project_layer(
+    def enable_diagnostics(
+        self,
+        layer_indices: list[int] | None = None,
+        query_indices: list[int] | None = None,
+        max_batches: int = 1,
+    ) -> None:
+        """Capture detached pre-averaging IAR attention for a bounded number of batches."""
+        layers = tuple(self.layer_indices if layer_indices is None else layer_indices)
+        queries = tuple(range(self.queries[0].shape[0]) if query_indices is None else query_indices)
+        if not layers or any(layer not in self.layer_indices for layer in layers):
+            raise ValueError("IAR diagnostic layers must be selected IAR layer indices.")
+        if not queries or any(not 0 <= query < self.queries[0].shape[0] for query in queries):
+            raise ValueError("IAR diagnostic query index is out of range.")
+        if max_batches <= 0:
+            raise ValueError("IAR diagnostic max_batches must be positive.")
+        self._diagnostic_selection = (tuple(dict.fromkeys(layers)), tuple(dict.fromkeys(queries)))
+        self._diagnostic_max_batches = max_batches
+        self._diagnostic_batches.clear()
+
+    def pop_diagnostics(self) -> list[dict]:
+        captures, self._diagnostic_batches = self._diagnostic_batches, []
+        return captures
+
+    def disable_diagnostics(self) -> None:
+        self._diagnostic_selection = None
+        self._diagnostic_batches.clear()
+
+    def _project_layer(
         self,
         selected_index: int,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         prefix_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if key_states.shape != value_states.shape or key_states.ndim != 4:
             raise ValueError("IAR expects matching cache K/V shaped [batch, heads, sequence, head_dim].")
         batch_size, _, sequence_length, _ = key_states.shape
@@ -315,14 +345,63 @@ class ImplicitActionReasoner(nn.Module):
         values = self.value_projections[selected_index](values)
         scores = torch.einsum("qd,bld->bql", query, keys) / math.sqrt(query.shape[-1])
         scores = scores.masked_fill(~prefix_mask[:, None].bool(), torch.finfo(scores.dtype).min)
-        return torch.einsum("bql,bld->bqd", scores.softmax(dim=-1), values)
+        attention = scores.softmax(dim=-1)
+        return torch.einsum("bql,bld->bqd", attention, values), attention
 
-    def forward(self, past_key_values: "DynamicCache", prefix_mask: torch.Tensor) -> torch.Tensor:
+    def project_layer(
+        self,
+        selected_index: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        prefix_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._project_layer(selected_index, key_states, value_states, prefix_mask)[0]
+
+    def forward(
+        self,
+        past_key_values: "DynamicCache",
+        prefix_mask: torch.Tensor,
+        visual_token_spans: tuple[tuple[int, int], ...] = (),
+        language_token_span: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         contexts = []
+        captured_attention = {}
+        captured_contexts = {}
         for selected_index, layer_index in enumerate(self.layer_indices):
             layer = past_key_values.layers[layer_index]
-            contexts.append(self.project_layer(selected_index, layer.keys, layer.values, prefix_mask))
-        return torch.stack(contexts).mean(dim=0)
+            context, attention = self._project_layer(selected_index, layer.keys, layer.values, prefix_mask)
+            contexts.append(context)
+            if self._diagnostic_selection is not None and layer_index in self._diagnostic_selection[0]:
+                captured_attention[layer_index] = attention
+                captured_contexts[layer_index] = context
+        averaged_context = torch.stack(contexts).mean(dim=0)
+        if self._diagnostic_selection is not None:
+            if len(self._diagnostic_batches) >= self._diagnostic_max_batches:
+                raise RuntimeError("Pop IAR diagnostics before capturing another batch.")
+            layers, queries = self._diagnostic_selection
+            self._diagnostic_batches.append(
+                {
+                    "layers": layers,
+                    "queries": queries,
+                    "attention": torch.stack([captured_attention[layer] for layer in layers], dim=1)[
+                        :, :, queries
+                    ]
+                    .detach()
+                    .float()
+                    .cpu(),
+                    "layer_contexts": torch.stack([captured_contexts[layer] for layer in layers], dim=1)[
+                        :, :, queries
+                    ]
+                    .detach()
+                    .float()
+                    .cpu(),
+                    "averaged_context": averaged_context[:, queries].detach().float().cpu(),
+                    "prefix_mask": prefix_mask.detach().bool().cpu(),
+                    "visual_token_spans": tuple(visual_token_spans),
+                    "language_token_span": language_token_span,
+                }
+            )
+        return averaged_context
 
 
 class SmolVLMWithExpertModel(nn.Module):

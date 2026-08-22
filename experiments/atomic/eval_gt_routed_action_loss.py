@@ -18,6 +18,10 @@ from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.random_utils import set_seed
 
 
+def _flow_repeat_seed(seed: int, batch_index: int, repeat_index: int) -> int:
+    return (seed + 1_000_003 * batch_index + repeat_index) % (2**63 - 1)
+
+
 def summarize(losses: dict[int, list[float]]) -> dict:
     per_skill = {}
     all_losses = []
@@ -36,7 +40,7 @@ def summarize(losses: dict[int, list[float]]) -> dict:
             }
         )
     if not all_losses:
-        raise ValueError("No held-out losses were collected.")
+        raise ValueError("No dataset-factory validation losses were collected.")
     means = [stats["mean"] for stats in per_skill.values() if stats["mean"] is not None]
     return {
         "per_skill": per_skill,
@@ -72,7 +76,9 @@ def summarize_routes(selected_experts: dict[int, list[int]], weights: dict[int, 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Measure held-out GT-routed atomic action loss.")
+    parser = argparse.ArgumentParser(
+        description="Measure GT-routed action loss on the dataset-factory validation split."
+    )
     parser.add_argument("--policy-path", required=True)
     parser.add_argument("--dataset-repo-id", default="k1000dai/libero_subtask_sarm")
     parser.add_argument("--dataset-revision", default="8ec70343c56430f5dbae09af6b073d879207fe7c")
@@ -120,7 +126,7 @@ def main() -> None:
     )
     train_dataset, eval_dataset = make_train_eval_datasets(split_cfg)
     if eval_dataset is None:
-        raise ValueError("eval_split must create a held-out dataset.")
+        raise ValueError("eval_split must create a dataset-factory validation split.")
     _resolve_atomic_subtask_mapping(train_dataset, policy_cfg)
 
     policy = make_policy(cfg=policy_cfg, ds_meta=eval_dataset.meta)
@@ -141,6 +147,7 @@ def main() -> None:
     )
 
     losses: dict[int, list[float]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
+    auxiliary_losses: dict[str, dict[int, list[float]]] = {}
     selected_experts: dict[int, list[int]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
     route_weights: dict[int, list[float]] = {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
     router = policy.model.vlm_with_expert.atomic_router
@@ -156,11 +163,42 @@ def main() -> None:
             skill_ids, _ = policy._atomic_batch_contract(batch)
             selected, weights = router(skill_ids)
             sample_loss = torch.zeros(skill_ids.shape[0], device=skill_ids.device)
-            for _ in range(args.noise_repeats):
-                repeat_loss, _ = policy.forward(batch, reduction="none")
-                sample_loss += repeat_loss.float() / args.noise_repeats
+            batch_auxiliary: dict[str, torch.Tensor] = {}
+            cuda_index = skill_ids.device.index
+            rng_devices = (
+                [torch.cuda.current_device() if cuda_index is None else cuda_index]
+                if skill_ids.device.type == "cuda"
+                else []
+            )
+            for repeat_index in range(args.noise_repeats):
+                with torch.random.fork_rng(devices=rng_devices):
+                    torch.manual_seed(_flow_repeat_seed(args.seed, batch_index, repeat_index))
+                    repeat_loss, diagnostics = policy.forward(
+                        batch, reduction="none", return_loss_components=True
+                    )
+                flow_loss = diagnostics.get("flow_loss_per_sample", repeat_loss)
+                sample_loss += flow_loss.float() / args.noise_repeats
+                for key, name in (
+                    ("implicit_fast_aux_loss_per_sample", "implicit_fast_aux_loss"),
+                    (
+                        "implicit_transition_focal_aux_loss_per_sample",
+                        "implicit_transition_focal_aux_loss",
+                    ),
+                    ("implicit_transition_ce_per_sample", "implicit_transition_plain_ce"),
+                ):
+                    if key in diagnostics:
+                        batch_auxiliary[name] = (
+                            batch_auxiliary.get(name, torch.zeros_like(diagnostics[key], dtype=torch.float32))
+                            + diagnostics[key].float() / args.noise_repeats
+                        )
             for skill_id, loss in zip(skill_ids.tolist(), sample_loss.tolist(), strict=True):
                 losses[skill_id].append(loss)
+            for name, values in batch_auxiliary.items():
+                per_skill_values = auxiliary_losses.setdefault(
+                    name, {skill_id: [] for skill_id in range(len(ATOMIC_SKILLS))}
+                )
+                for skill_id, value in zip(skill_ids.tolist(), values.tolist(), strict=True):
+                    per_skill_values[skill_id].append(value)
             for skill_id, expert_id, weight in zip(
                 skill_ids.tolist(), selected.tolist(), weights.tolist(), strict=True
             ):
@@ -172,15 +210,31 @@ def main() -> None:
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_revision": args.dataset_revision,
         "eval_split": args.eval_split,
+        "split_provenance": {
+            "name": "dataset_factory_validation_split",
+            "source": "make_train_eval_datasets(DatasetConfig(eval_split=...))",
+            "is_validation": True,
+            "is_preregistered_offline_test": False,
+        },
         "seed": args.seed,
         "noise_repeats": args.noise_repeats,
+        "flow_rng": {
+            "scheme": "torch.random.fork_rng_per_repeat_forward",
+            "seed_formula": "(seed + 1000003 * batch_index + repeat_index) % (2**63 - 1)",
+            "scope": "CPU and active CUDA device; restored after each forward",
+        },
+        "loss_name": "pure_flow_matching_loss",
         **summarize(losses),
+        "auxiliary_losses": {
+            name: summarize(per_skill_values) for name, per_skill_values in auxiliary_losses.items()
+        },
         "routing": summarize_routes(selected_experts, route_weights),
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n")
 
+    print("PURE flow-matching loss (FAST and transition auxiliaries excluded)")
     print(f"{'skill':<8} {'samples':>9} {'mean':>12} {'median':>12} {'p95':>12}")
     for skill, stats in result["per_skill"].items():
         if stats["mean"] is None:
@@ -191,11 +245,10 @@ def main() -> None:
                 f"{stats['median']:>12.6f} {stats['p95']:>12.6f}"
             )
     print(f"macro_mean={result['macro_mean']:.6f} micro_mean={result['micro_mean']:.6f}")
+    for name, summary in result["auxiliary_losses"].items():
+        print(f"{name}: macro_mean={summary['macro_mean']:.6f} micro_mean={summary['micro_mean']:.6f}")
     print()
-    print(
-        f"{'skill':<8} {'route_acc':>10} {'expert':>8} "
-        f"{'expert_share':>13} {'shared_share':>13}"
-    )
+    print(f"{'skill':<8} {'route_acc':>10} {'expert':>8} {'expert_share':>13} {'shared_share':>13}")
     for skill, stats in result["routing"].items():
         if stats["route_accuracy"] is None:
             print(f"{skill:<8} {'n/a':>10}")

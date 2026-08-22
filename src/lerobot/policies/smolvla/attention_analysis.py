@@ -18,6 +18,93 @@ import numpy as np
 import torch
 
 
+def normalized_jsd(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Jensen-Shannon divergence normalized to [0, 1]."""
+    midpoint = (left + right) / 2
+    left_kl = torch.where(left > 0, left * (left.log() - midpoint.log()), 0).sum(dim=-1)
+    right_kl = torch.where(right > 0, right * (right.log() - midpoint.log()), 0).sum(dim=-1)
+    return (left_kl + right_kl) / (2 * np.log(2))
+
+
+def iar_capture_metrics(capture: dict, state_context: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Reduce one transient IAR capture without retaining raw token attention.
+
+    Query/layer diversity is normalized Jensen-Shannon divergence (0 identical, 1 maximally
+    different). Padding is removed and each selected distribution is renormalized first.
+    """
+    attention = capture["attention"].float()
+    contexts = capture["layer_contexts"].float()
+    averaged_context = capture["averaged_context"].float()
+    prefix_mask = capture["prefix_mask"].bool()
+    if attention.ndim != 4 or attention.shape[0] != prefix_mask.shape[0]:
+        raise ValueError("IAR attention must be [batch, layer, query, token].")
+    if attention.shape[-1] != prefix_mask.shape[-1]:
+        raise ValueError("IAR attention and prefix mask token dimensions must match.")
+    if contexts.shape[:3] != attention.shape[:3] or averaged_context.shape[:2] != (
+        attention.shape[0],
+        attention.shape[2],
+    ):
+        raise ValueError("IAR contexts must align with captured layers and queries.")
+    language_span = capture["language_token_span"]
+    if language_span is None:
+        raise ValueError("IAR token diagnostics require the language token span.")
+
+    valid = prefix_mask[:, None, None]
+    attention = attention * valid
+    attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attention.dtype).eps)
+    token_count = prefix_mask.sum(dim=-1)[:, None, None]
+    entropy = -(torch.where(attention > 0, attention * attention.log(), 0).sum(dim=-1))
+    entropy = torch.where(token_count > 1, entropy / token_count.float().log(), torch.zeros_like(entropy))
+
+    image_mask = torch.zeros_like(prefix_mask)
+    for start, end in capture["visual_token_spans"]:
+        image_mask[:, start:end] = True
+    language_mask = torch.zeros_like(prefix_mask)
+    language_mask[:, language_span[0] : language_span[1]] = True
+    image_mask &= prefix_mask
+    language_mask &= prefix_mask
+    other_mask = prefix_mask & ~image_mask & ~language_mask
+    image_mass = (attention * image_mask[:, None, None]).sum(dim=-1)
+    language_mass = (attention * language_mask[:, None, None]).sum(dim=-1)
+    other_mass = (attention * other_mask[:, None, None]).sum(dim=-1)
+
+    def signature(token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        values = attention if token_mask is None else attention * token_mask[:, None, None]
+        return values / values.sum(dim=(1, 2, 3), keepdim=True).clamp_min(torch.finfo(values.dtype).eps)
+
+    query_diversity = [
+        normalized_jsd(attention[:, layer, left], attention[:, layer, right])
+        for layer in range(attention.shape[1])
+        for left in range(attention.shape[2])
+        for right in range(left + 1, attention.shape[2])
+    ]
+    layer_diversity = [
+        normalized_jsd(attention[:, left, query], attention[:, right, query])
+        for query in range(attention.shape[2])
+        for left in range(attention.shape[1])
+        for right in range(left + 1, attention.shape[1])
+    ]
+    empty = torch.empty(0, dtype=torch.float32)
+    state_context = state_context.detach().float().cpu().flatten(1)
+    return {
+        "image_mass": image_mass,
+        "language_mass": language_mass,
+        "other_mass": other_mass,
+        "normalized_entropy": entropy,
+        "attention_signature": signature(),
+        "visual_attention_signature": signature(image_mask),
+        "language_attention_signature": signature(language_mask),
+        "query_diversity": torch.cat(query_diversity) if query_diversity else empty,
+        "layer_diversity": torch.cat(layer_diversity) if layer_diversity else empty,
+        "layer_context_norm": contexts.norm(dim=-1),
+        "layer_context_variance": contexts.var(dim=-1, unbiased=False),
+        "context_norm": averaged_context.norm(dim=-1),
+        "context_variance": averaged_context.var(dim=-1, unbiased=False),
+        "state_context_norm": state_context.norm(dim=-1),
+        "state_context_variance": state_context.var(dim=-1, unbiased=False),
+    }
+
+
 class AttentionMapCollector:
     """Average real action-to-visual attention probabilities and save compact NPZ files."""
 
@@ -53,12 +140,7 @@ class AttentionMapCollector:
             raise ValueError("Attention-map cameras must have the same visual-token count.")
         stacked = torch.stack(images, dim=1).detach().float().cpu()
         self._images = (
-            ((stacked + 1) * 127.5)
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(0, 1, 3, 4, 2)
-            .numpy()
+            ((stacked + 1) * 127.5).round().clamp(0, 255).to(torch.uint8).permute(0, 1, 3, 4, 2).numpy()
         )
         batch_size = self._images.shape[0]
         if task_descriptions is None:
@@ -98,9 +180,7 @@ class AttentionMapCollector:
         attention = probs.detach().float().mean(dim=(1, 2))
         camera_maps = []
         for start, end in self._visual_token_spans:
-            camera_map = torch.zeros(
-                probs.shape[0], end - start, dtype=torch.float32, device=probs.device
-            )
+            camera_map = torch.zeros(probs.shape[0], end - start, dtype=torch.float32, device=probs.device)
             for batch_idx in range(probs.shape[0]):
                 indices = original_indices[batch_idx]
                 is_camera = (indices >= start) & (indices < end)

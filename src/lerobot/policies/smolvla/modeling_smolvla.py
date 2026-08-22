@@ -292,7 +292,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
         if self._implicit_transition_enabled():
             actions, transition_logits = actions
-            selected_skill = transition_logits.argmax(dim=-1)
+            selected_skill = kwargs.get("atomic_skill_id")
+            if selected_skill is None:
+                selected_skill = transition_logits.argmax(dim=-1)
             self._append_implicit_transition_history(selected_skill)
             self._last_transition_prediction = selected_skill.clone()
         elif self._skill_linking_enabled():
@@ -368,8 +370,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
             transition_history_valid = None
             if self._implicit_transition_enabled():
                 if atomic_skill_id is not None:
-                    raise ValueError(
-                        "Do not manually pass `atomic_skill_id` while implicit transition planning is enabled."
+                    if (
+                        not self.config.atomic_data_enabled
+                        or batch[OBS_STATE].shape[0] != 1
+                        or atomic_skill_id.shape != (1,)
+                    ):
+                        raise ValueError("Implicit GT routing requires one skill ID and batch_size=1.")
+                    if ((atomic_skill_id < 0) | (atomic_skill_id >= len(ATOMIC_SKILLS))).any():
+                        raise ValueError("Manual atomic skill ID is outside the supported skill vocabulary.")
+                    self._atomic_planner_skill = int(atomic_skill_id[0].item())
+                    self.atomic_planner_history.append(
+                        {
+                            "skill": ATOMIC_SKILLS[self._atomic_planner_skill],
+                            "parse_failure": False,
+                            "source": "gt_oracle",
+                            "latency_s": 0.0,
+                        }
                     )
                 self._ensure_implicit_transition_history(batch[OBS_STATE].shape[0], batch[OBS_STATE].device)
                 transition_history_ids = self._implicit_transition_history_ids
@@ -837,7 +853,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return model
 
     def forward(
-        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
+        self,
+        batch: dict[str, Tensor],
+        noise=None,
+        time=None,
+        reduction: str = "mean",
+        return_loss_components: bool = False,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss.
 
@@ -848,7 +869,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             reduction: How to reduce the loss. Options:
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+            return_loss_components: Include detached per-sample flow/auxiliary diagnostics. This is
+                only valid with ``reduction="none"`` and is disabled for training logs by default.
         """
+        if return_loss_components and reduction != "none":
+            raise ValueError("Per-sample loss components require reduction='none'.")
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
@@ -978,6 +1003,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 else:
                     num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                     per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+                if return_loss_components:
+                    loss_dict["flow_loss_per_sample"] = per_sample_loss.detach()
+                    if fast_losses is not None:
+                        loss_dict["implicit_fast_aux_loss_per_sample"] = fast_losses.detach()
+                    if implicit_transition_losses is not None:
+                        loss_dict["implicit_transition_focal_aux_loss_per_sample"] = (
+                            implicit_transition_losses.detach()
+                        )
+                        loss_dict["implicit_transition_ce_per_sample"] = implicit_transition_ce.detach()
                 if fast_losses is not None:
                     loss_dict["flow_loss"] = per_sample_loss.mean().item()
                     loss_dict["fast_loss"] = fast_losses.mean().item()
@@ -1714,10 +1748,18 @@ class VLAFlowMatching(nn.Module):
             self.atomic_previous_skill_embedding(previous_skill.long().to(device=state.device)),
         )
 
-    def _implicit_context(self, past_key_values, prefix_pad_masks: Tensor) -> Tensor:
+    def _implicit_context(
+        self,
+        past_key_values,
+        prefix_pad_masks: Tensor,
+        visual_token_spans: tuple[tuple[int, int], ...] = (),
+        task_token_span: tuple[int, int] | None = None,
+    ) -> Tensor:
         if self.implicit_action_reasoner is None:
             raise RuntimeError("Implicit FAST-KI context requested while the intervention is disabled.")
-        return self.implicit_action_reasoner(past_key_values, prefix_pad_masks)
+        return self.implicit_action_reasoner(
+            past_key_values, prefix_pad_masks, visual_token_spans, task_token_span
+        )
 
     def _fused_implicit_context(self, implicit_context: Tensor, state: Tensor) -> Tensor:
         state_context = self.state_proj(state)[:, None]
@@ -1865,7 +1907,9 @@ class VLAFlowMatching(nn.Module):
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
             )
-            implicit_context = self._implicit_context(past_key_values, prefix_pad_masks)
+            implicit_context = self._implicit_context(
+                past_key_values, prefix_pad_masks, visual_token_spans, task_token_span
+            )
             fused_context = self._fused_implicit_context(implicit_context, state)
             fast_losses = self._fast_losses(fused_context, fast_action_tokens, fast_action_masks)
             implicit_transition_logits = self._implicit_transition_logits(
@@ -1961,12 +2005,16 @@ class VLAFlowMatching(nn.Module):
         implicit_transition_logits = None
         if self._implicit_fast_ki_enabled():
             implicit_context = self._fused_implicit_context(
-                self._implicit_context(past_key_values, prefix_pad_masks), state
+                self._implicit_context(
+                    past_key_values, prefix_pad_masks, visual_token_spans, task_token_span
+                ),
+                state,
             ).detach()
             implicit_transition_logits = self._implicit_transition_logits(
                 implicit_context, transition_history_ids, transition_history_valid
             )
-            atomic_skill_id = implicit_transition_logits.argmax(dim=-1)
+            if atomic_skill_id is None:
+                atomic_skill_id = implicit_transition_logits.argmax(dim=-1)
         transition_logits = None
         if self._skill_linking_enabled():
             transition_logits = self._transition_logits_from_prefix(

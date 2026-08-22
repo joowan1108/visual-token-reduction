@@ -12,6 +12,7 @@ from torch import nn
 import lerobot.policies.smolvla.smolvlm_with_expert as smolvlm_with_expert
 from lerobot.datasets.sampler import AtomicSkillSampler
 from lerobot.lerobot_types import TransitionKey
+from lerobot.policies.smolvla.attention_analysis import iar_capture_metrics, normalized_jsd
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
     ATOMIC_SKILLS,
@@ -366,6 +367,165 @@ def test_implicit_fast_ki_layer_independence_gradient_isolation_and_no_leakage()
     assert flow_model.vlm_with_expert.atomic_router.route.weight.grad is None
 
 
+def test_iar_capture_is_selected_bounded_and_metrics_exclude_padding():
+    reasoner = ImplicitActionReasoner([0, 1], kv_size=4, hidden_size=3, num_queries=2)
+    layers = [SimpleNamespace(keys=torch.randn(1, 2, 4, 2), values=torch.randn(1, 2, 4, 2)) for _ in range(2)]
+    cache = SimpleNamespace(layers=layers)
+    mask = torch.tensor([[True, True, True, False]])
+    reasoner.enable_diagnostics([1], [0, 1], max_batches=1)
+    reasoner(cache, mask, ((0, 2),), (2, 4))
+    with pytest.raises(RuntimeError, match="Pop IAR diagnostics"):
+        reasoner(cache, mask, ((0, 2),), (2, 4))
+    capture = reasoner.pop_diagnostics()[0]
+    assert capture["attention"].shape == (1, 1, 2, 4)
+    assert capture["layers"] == (1,)
+    assert not capture["attention"][..., -1].any()
+    metrics = iar_capture_metrics(capture, torch.tensor([[3.0, 4.0, 0.0]]))
+    torch.testing.assert_close(
+        metrics["image_mass"] + metrics["language_mass"] + metrics["other_mass"],
+        torch.ones(1, 1, 2),
+    )
+    assert metrics["query_diversity"].numel() == 1
+    assert metrics["layer_diversity"].numel() == 0
+    assert metrics["attention_signature"].shape == (1, 1, 2, 4)
+    torch.testing.assert_close(metrics["attention_signature"].sum(), torch.tensor(1.0))
+    torch.testing.assert_close(metrics["state_context_norm"], torch.tensor([5.0]))
+    assert (metrics["normalized_entropy"] >= 0).all()
+    assert (metrics["normalized_entropy"] <= 1).all()
+    reasoner.disable_diagnostics()
+
+
+def test_iar_skill_signature_retains_token_positions_beyond_modality_mass():
+    attention = torch.tensor([[[[0.5, 0.0, 0.5, 0.0]]], [[[0.0, 0.5, 0.5, 0.0]]]])
+    capture = {
+        "attention": attention,
+        "layer_contexts": torch.zeros(2, 1, 1, 2),
+        "averaged_context": torch.zeros(2, 1, 2),
+        "prefix_mask": torch.tensor([[True, True, True, False]] * 2),
+        "visual_token_spans": ((0, 2),),
+        "language_token_span": (2, 4),
+    }
+    metrics = iar_capture_metrics(capture, torch.zeros(2, 2))
+    torch.testing.assert_close(metrics["image_mass"][0], metrics["image_mass"][1])
+    torch.testing.assert_close(metrics["language_mass"][0], metrics["language_mass"][1])
+    assert (
+        normalized_jsd(
+            metrics["attention_signature"][0].flatten(),
+            metrics["attention_signature"][1].flatten(),
+        )
+        > 0
+    )
+
+
+def test_implicit_gt_override_preserves_route_history_and_timeline():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        rtc_config=None,
+        n_action_steps=1,
+        atomic_data_enabled=True,
+        implicit_fast_ki_enabled=True,
+        atomic_planner_enabled=False,
+        atomic_classifier_enabled=False,
+        action_feature=SimpleNamespace(shape=(1,)),
+        adapt_to_pi_aloha=False,
+    )
+    policy.reset()
+    policy._prepare_batch = lambda batch: batch
+    captured = {}
+
+    def action_chunk(batch, noise, **kwargs):
+        captured.update(kwargs)
+        return torch.zeros(1, 1, 1)
+
+    policy._get_action_chunk = action_chunk
+    batch = {OBS_STATE: torch.zeros(1, 2)}
+    policy.select_action(batch, atomic_skill_id=torch.tensor([2]))
+    assert captured["atomic_skill_id"].tolist() == [2]
+    assert captured["transition_history_valid"].tolist() == [[False, False]]
+    assert policy.atomic_planner_history[-1]["source"] == "gt_oracle"
+    with pytest.raises(ValueError, match="batch_size=1"):
+        policy.reset()
+        policy.select_action({OBS_STATE: torch.zeros(2, 2)}, atomic_skill_id=torch.tensor([2]))
+    with pytest.raises(ValueError, match="outside"):
+        policy.reset()
+        policy.select_action(batch, atomic_skill_id=torch.tensor([6]))
+
+    del policy._get_action_chunk
+    policy.reset()
+    policy._ensure_implicit_transition_history(1, torch.device("cpu"))
+    predicted_logits = torch.zeros(1, len(ATOMIC_SKILLS))
+    predicted_logits[:, 5] = 1
+    policy.model = SimpleNamespace(
+        sample_actions=lambda *args, **kwargs: (torch.zeros(1, 1, 1), predicted_logits)
+    )
+    policy.prepare_images = lambda batch, current_phase=None: ([], [])
+    policy.prepare_state = lambda batch: batch[OBS_STATE]
+    policy._get_action_chunk(
+        {
+            OBS_STATE: torch.zeros(1, 2),
+            "observation.language.tokens": torch.zeros(1, 1, dtype=torch.long),
+            "observation.language.attention_mask": torch.ones(1, 1, dtype=torch.bool),
+        },
+        atomic_skill_id=torch.tensor([2]),
+        transition_history_ids=policy._implicit_transition_history_ids,
+        transition_history_valid=policy._implicit_transition_history_valid,
+    )
+    assert policy._implicit_transition_history_ids.tolist() == [[0, 2]]
+    assert policy._last_transition_prediction.tolist() == [2]
+
+
+def test_unreduced_loss_components_keep_pure_flow_separate():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
+        atomic_data_enabled=True,
+        implicit_fast_ki_enabled=True,
+        atomic_classifier_enabled=False,
+        atomic_planner_enabled=False,
+        skill_linking_enabled=False,
+        phase_camera_masking_enabled=False,
+        action_feature=SimpleNamespace(shape=(1,)),
+        max_action_dim=1,
+        implicit_fast_loss_weight=0.1,
+        implicit_transition_loss_weight=0.2,
+        implicit_transition_focal_gamma=0.0,
+    )
+    policy.prepare_images = lambda batch, current_phase=None: ([], [])
+    policy.prepare_state = lambda batch: batch[OBS_STATE]
+    policy.prepare_action = lambda batch: batch[ACTION]
+    policy._atomic_batch_contract = lambda batch: (
+        torch.tensor([0, 1]),
+        torch.tensor([[False, False], [False, True]]),
+    )
+    policy._implicit_transition_targets = lambda batch: (
+        torch.tensor([1, 0]),
+        torch.zeros(2, 2, dtype=torch.long),
+        torch.zeros(2, 2, dtype=torch.bool),
+    )
+    transition_logits = torch.tensor([[0.0, 1.0, 0, 0, 0, 0], [1.0, 0.0, 0, 0, 0, 0]])
+    policy.model = SimpleNamespace(
+        forward=lambda *args, **kwargs: (
+            torch.tensor([[[1.0], [3.0]], [[2.0], [100.0]]]),
+            torch.tensor([4.0, 5.0]),
+            transition_logits,
+        )
+    )
+    batch = {
+        OBS_STATE: torch.zeros(2, 1),
+        ACTION: torch.zeros(2, 2, 1),
+        "observation.language.tokens": torch.zeros(2, 1, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 1, dtype=torch.bool),
+    }
+    total, diagnostics = policy.forward(batch, reduction="none", return_loss_components=True)
+    torch.testing.assert_close(diagnostics["flow_loss_per_sample"], torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(diagnostics["implicit_fast_aux_loss_per_sample"], torch.tensor([4.0, 5.0]))
+    assert not torch.equal(total, diagnostics["flow_loss_per_sample"])
+    _, scalar_logs = policy.forward(batch)
+    assert all(not isinstance(value, torch.Tensor) for value in scalar_logs.values())
+
+
 def test_implicit_fast_tokenizer_ignores_pick_place_pick_boundaries():
     tokenizer = SmolVLAImplicitFastActionTokenizerProcessorStep.__new__(
         SmolVLAImplicitFastActionTokenizerProcessorStep
@@ -553,6 +713,17 @@ def test_held_out_atomic_metrics_include_implicit_fast_ki():
     source = (Path(__file__).parents[3] / "src/lerobot/scripts/lerobot_train.py").read_text()
     assert 'getattr(active_cfg, "implicit_fast_ki_enabled", False)' in source
     assert source.count("if atomic_eval_metrics_enabled:") == 2
+
+
+def test_atomic_diagnostic_scripts_freeze_validation_provenance_and_flow_rng():
+    root = Path(__file__).parents[3]
+    flow_source = (root / "experiments/atomic/eval_gt_routed_action_loss.py").read_text()
+    iar_source = (root / "experiments/atomic/eval_iar_diagnostics.py").read_text()
+    assert "torch.random.fork_rng" in flow_source
+    assert "dataset_factory_validation_split" in flow_source
+    assert "dataset_factory_validation_split" in iar_source
+    assert "sample_pair_count" not in iar_source
+    assert '"comparison": "group_mean_vs_group_mean"' in iar_source
 
 
 def test_atomic_classifier_prefix_prefill_skips_missing_expert_tokens():

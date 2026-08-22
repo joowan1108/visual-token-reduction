@@ -444,3 +444,107 @@ Only boundary-derived padding and the superseded temporal condition changed. FAS
 non-suffix episode padding, classifier 75:25 behavior is unchanged, and stride `1` retains its exact baseline
 sampling path. This is an AtomicVLA-aligned adaptation, not a claim of reproducing the paper's think windows.
 No training/evaluation run, dependency change, result interpretation, commit, or push was performed.
+
+## Implicit FAST-KI diagnostics and GT routing override (2026-08-22)
+
+Results inspected: none. No metric definition, dataset revision, split, seed, rollout budget, or evaluation
+criterion was changed. Baseline and normal implicit predicted-routing behavior remain the default.
+
+### Changed files
+
+- `src/lerobot/policies/smolvla/modeling_smolvla.py`
+  - Added explicit `return_loss_components=true` plumbing for `reduction="none"`; it exposes detached pure
+    flow, FAST auxiliary, transition focal auxiliary, and plain transition CE tensors without changing scalar
+    training loss/logging.
+  - Permits batch-size-1 in-range GT skill IDs in implicit mode, keeps IAR/projected KV/state context and flow
+    denoising active, bypasses only transition argmax, appends the executed GT skill to two-slot history, and
+    records `source="gt_oracle"`. Predicted routing is unchanged when no override is supplied.
+- `src/lerobot/policies/smolvla/smolvlm_with_expert.py`
+  - Added opt-in, detached IAR capture for selected configured layers/queries before layer averaging. Capture is
+    bounded by an explicit batch limit and must be popped before another batch.
+- `src/lerobot/policies/smolvla/attention_analysis.py`
+  - Added padding-excluding image/language/other attention mass, normalized entropy, normalized JSD query/layer
+    diversity with pair counts, and separate IAR/state context norm/variance reducers.
+- `experiments/atomic/eval_gt_routed_action_loss.py`
+  - Reports per-skill mean/median/p95 from pure flow-matching loss only. Clearly named FAST and transition
+    auxiliaries are separate when present; legacy SG-MoE falls back to its already-pure unreduced loss.
+- `experiments/atomic/eval_iar_diagnostics.py`
+  - Added held-out seeded-subset checkpoint evaluation with the required policy/max-samples/batch/workers/seed/
+    output CLI, concise tables, JSON, all-present-skill profiles/differences, and explicit absent groups.
+  - Raw token tensors are consumed one batch at a time and are not stored; optional NPZ output was omitted.
+- `tests/policies/smolvla/test_atomic_sgmoe.py`
+  - Added focused small-tensor coverage for bounded selected IAR capture/metrics, GT override validation/history/
+    timeline, and pure-flow versus auxiliary loss components.
+
+No dependency, checkpoint schema, or persistent configuration field was added. IAR capture is enabled only by
+the diagnostic script's runtime call. `lerobot-eval --atomic_gt_routing=true` retains its existing validation
+that `eval.batch_size=1` and `env.max_parallel_tasks=1`.
+
+### Commands and exact results
+
+```bash
+uv run ruff format <six modified Python files>
+# 5 files reformatted; 1 unchanged.
+
+uv run ruff check --ignore SIM102 <six modified Python files>
+# All checks passed. SIM102 is ignored because two pre-existing unrelated findings remain in modeling_smolvla.py.
+
+uv run python -m py_compile <six modified Python files>
+# Passed.
+
+uv run pytest -q tests/policies/smolvla/test_atomic_sgmoe.py \
+  -k 'iar_capture or implicit_gt_override or unreduced_loss_components'
+# Collection failed before tests ran: ImportError for libcublasLt.so.12.
+
+LD_LIBRARY_PATH=<all bundled .venv NVIDIA library directories> uv run python -c 'import torch'
+# Exited 135 during torch import; the local CUDA/PyTorch environment remains unusable.
+```
+
+### Assumptions and deviations
+
+- Token-type skill differences use normalized JSD over each skill's mean `[image, language, other]` attention
+  profile; query and layer diversity use normalized JSD over full valid prefix-token distributions. Pair counts
+  are persisted and absent skills, including `pick`/`place`/`open` when absent, are marked rather than imputed.
+- State remains the separate `state_proj(state)` context concatenated after IAR. It is never labeled as IAR
+  token attention and is reported in a separate JSON section/table line.
+- GT closed-loop routing is a privileged oracle diagnostic, not AtomicVLA's learned think/act policy. Transition
+  logits are still computed for diagnostics, but only their argmax is bypassed.
+- No checkpoint evaluation, LIBERO rollout, training, raw-result write, result interpretation, commit, or push
+  was performed.
+
+### Evaluator corrections (2026-08-22)
+
+Results inspected: none. These corrections change diagnostic implementation/provenance labels only; no
+dataset, split fraction, seed default, metric threshold, or evaluation criterion was changed.
+
+- `src/lerobot/policies/smolvla/attention_analysis.py` now returns bounded per-sample normalized
+  layer-by-query-by-token attention signatures, plus visual-only and language-only signatures. Modality masses
+  remain separate summaries.
+- `experiments/atomic/eval_iar_diagnostics.py` pads only the token axis across batches, then flattens the aligned
+  layer/query/token signature. Skill comparisons are normalized JSD between group-mean full signatures and
+  report `left_count`, `right_count`, and `comparison="group_mean_vs_group_mean"`; the misleading Cartesian
+  `sample_pair_count` was removed. Visual-only and language-only group-mean JSD are also reported.
+- `experiments/atomic/eval_gt_routed_action_loss.py` wraps every repeat forward in `torch.random.fork_rng` and
+  resets CPU/active-CUDA RNG from `(seed + 1000003 * batch_index + repeat_index) % (2**63 - 1)`. This makes
+  internally sampled flow noise/time checkpoint-independent without changing DataLoader ordering.
+- Both evaluators identify their source as `dataset_factory_validation_split`, produced by
+  `make_train_eval_datasets(DatasetConfig(eval_split=0.1))`, and explicitly state that it is validation rather
+  than the preregistered offline test. Existing `eval_split` and result fields remain for compatibility; no
+  nonexistent 80/10/10 manifest is claimed.
+- `tests/policies/smolvla/test_atomic_sgmoe.py` adds small-tensor position-sensitive signature coverage and
+  static evaluator contract checks.
+
+`src/lerobot/policies/smolvla/smolvlm_with_expert.py` was not touched, preserving its original mixed line endings.
+Only targeted Ruff and `py_compile` checks were authorized for this correction.
+
+```bash
+uv run ruff check src/lerobot/policies/smolvla/attention_analysis.py \
+  experiments/atomic/eval_gt_routed_action_loss.py \
+  experiments/atomic/eval_iar_diagnostics.py tests/policies/smolvla/test_atomic_sgmoe.py
+# All checks passed!
+
+uv run python -m py_compile <the same four Python files>
+# Passed.
+```
+
+No pytest, training, checkpoint evaluation, dependency change, commit, or push was performed.
