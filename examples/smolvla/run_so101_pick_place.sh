@@ -11,11 +11,15 @@ DURATION="${DURATION:-30}"
 DEVICE="${DEVICE:-cuda}"
 MAX_RELATIVE_TARGET="${MAX_RELATIVE_TARGET:-5}"
 POLICY_PATH="${POLICY_PATH:-CoRL2026-CSI/smolvla_IsaacLab-SO101_pick_place_baseCaP_100epi_50ep-appendix}"
+POLICY_REVISION="${POLICY_REVISION:-}"
 ROLLOUT_STRATEGY="${ROLLOUT_STRATEGY:-base}"
+
+policy_args=(--policy.path="$POLICY_PATH")
+[[ -z "$POLICY_REVISION" ]] || policy_args+=(--policy.pretrained_revision="$POLICY_REVISION")
 
 exec uv run lerobot-rollout \
   --strategy.type="$ROLLOUT_STRATEGY" \
-  --policy.path="$POLICY_PATH" \
+  "${policy_args[@]}" \
   --robot.type=so101_follower \
   --robot.port="$ROBOT_PORT" \
   --robot.id="$ROBOT_ID" \

@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,9 +14,54 @@ from experiments.domain_arithmetic_so101.dart_merge import (
     merge_checkpoints,
     merge_tensor,
 )
+from experiments.domain_arithmetic_so101.prepare_target_dataset import (
+    canonicalize_joint_vector,
+    dataset_content_manifest,
+    image_for_writer,
+)
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.lerobot_train import _use_dataset_processor_stats
+
+
+def test_workflow_condition_paths(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    result = subprocess.run(
+        [script, "check"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "RUN_ROOT": str(tmp_path / "run")},
+    )
+    assert result.stdout.strip() == "workflow condition paths OK"
+
+
+def test_old_gripper_convention_is_canonicalized_without_touching_arm_joints() -> None:
+    vector = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, -40.0])
+    converted = canonicalize_joint_vector(vector)
+
+    assert torch.equal(converted[:5], vector[:5])
+    assert converted[-1].item() == 30.0
+    assert canonicalize_joint_vector(vector.index_put((torch.tensor([5]),), torch.tensor([-100.0])))[-1] == 0
+    assert canonicalize_joint_vector(vector.index_put((torch.tensor([5]),), torch.tensor([100.0])))[-1] == 100
+
+
+def test_decoded_chw_image_is_prepared_for_hwc_writer() -> None:
+    image = torch.arange(3 * 4 * 5, dtype=torch.uint8).reshape(3, 4, 5)
+    prepared = image_for_writer(image, {"shape": (4, 5, 3)})
+    assert prepared.shape == (4, 5, 3)
+    assert prepared.is_contiguous()
+    assert torch.equal(prepared.permute(2, 0, 1), image)
+
+
+def test_target_content_manifest_is_sorted_and_excludes_itself(tmp_path: Path) -> None:
+    (tmp_path / "z").write_bytes(b"z")
+    (tmp_path / "a").write_bytes(b"a")
+    (tmp_path / "target_preparation.json").write_bytes(b"ignored")
+    manifest = dataset_content_manifest(tmp_path)
+
+    assert [file["path"] for file in manifest["files"]] == ["a", "z"]
+    assert len(manifest["tree_sha256"]) == 64
 
 
 def _checkpoint(path: Path, tensors: dict[str, torch.Tensor], artifacts: bool = False) -> Path:
