@@ -10,10 +10,12 @@ TOP_CAMERA="${TOP_CAMERA:-2}"
 DURATION="${DURATION:-30}"
 DEVICE="${DEVICE:-cuda}"
 MAX_RELATIVE_TARGET="${MAX_RELATIVE_TARGET:-5}"
+POLICY_PATH="${POLICY_PATH:-CoRL2026-CSI/smolvla_IsaacLab-SO101_pick_place_baseCaP_100epi_50ep-appendix}"
+ROLLOUT_STRATEGY="${ROLLOUT_STRATEGY:-base}"
 
 exec uv run lerobot-rollout \
-  --strategy.type=base \
-  --policy.path=CoRL2026-CSI/smolvla_IsaacLab-SO101_pick_place_baseCaP_100epi_50ep-appendix \
+  --strategy.type="$ROLLOUT_STRATEGY" \
+  --policy.path="$POLICY_PATH" \
   --robot.type=so101_follower \
   --robot.port="$ROBOT_PORT" \
   --robot.id="$ROBOT_ID" \

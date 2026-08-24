@@ -85,6 +85,10 @@ else:
     PeftModel = None
 
 
+def _use_dataset_processor_stats(cfg: TrainPipelineConfig, pretrained_path: str | Path | None) -> bool:
+    return not pretrained_path or (not cfg.resume and not cfg.preserve_pretrained_processor_stats)
+
+
 def _resolve_atomic_subtask_mapping(dataset, policy_config) -> list[int]:
     mapping_path = policy_config.atomic_subtask_to_skill_path
     if mapping_path is None:
@@ -464,7 +468,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_pretrained_path = None
 
     processor_kwargs = {}
-    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+    use_dataset_processor_stats = _use_dataset_processor_stats(cfg, processor_pretrained_path)
+    if use_dataset_processor_stats:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     if cfg.is_reward_model_training:
@@ -489,7 +494,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # been adapted by the policy (e.g. EVO1 pads state/action stats to max_state_dim),
         # and force-feeding raw dataset stats over them crashes normalization (#4006).
         # This mirrors the `dataset_stats` kwarg above, which is also skipped on resume.
-        if not cfg.resume:
+        if use_dataset_processor_stats:
             preprocessor_overrides["normalizer_processor"]["stats"] = dataset.meta.stats
             postprocessor_overrides["unnormalizer_processor"]["stats"] = dataset.meta.stats
         if getattr(active_cfg, "use_relative_actions", False):

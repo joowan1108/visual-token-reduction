@@ -137,6 +137,7 @@ class TrainPipelineConfig(HubMixin):
     # A non-positive value disables periodic saving, keeping only the final checkpoint.
     save_freq: int = 20_000
     use_policy_training_preset: bool = True
+    preserve_pretrained_processor_stats: bool = False
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
