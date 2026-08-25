@@ -74,6 +74,7 @@ def prepare_target_dataset(output: Path) -> None:
         revision=SOURCE_REVISION,
         episodes=[SOURCE_EPISODE],
         return_uint8=True,
+        video_backend="pyav",
     )
     if source.fps != 10 or source.num_episodes != 1 or len(source) != EXPECTED_FRAMES:
         raise ValueError(
