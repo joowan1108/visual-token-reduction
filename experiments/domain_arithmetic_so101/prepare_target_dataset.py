@@ -59,7 +59,7 @@ def validate_target_contract(source: LeRobotDataset) -> None:
 
     for key in (OBS_STATE, ACTION):
         feature = source.meta.features.get(key, {})
-        if feature.get("dtype") != "float32" or feature.get("shape") != [6]:
+        if feature.get("dtype") != "float32" or tuple(feature.get("shape") or ()) != (6,):
             raise ValueError(f"{key} must be one float32 six-joint vector, got {feature!r}.")
         if tuple(feature.get("names") or ()) != JOINT_NAMES:
             raise ValueError(f"Unexpected {key} joint order: {feature.get('names')!r}.")
@@ -73,7 +73,7 @@ def validate_target_contract(source: LeRobotDataset) -> None:
         video_info = feature.get("info") or {}
         if (
             feature.get("dtype") != "video"
-            or feature.get("shape") != [480, 640, 3]
+            or tuple(feature.get("shape") or ()) != (480, 640, 3)
             or video_info.get("video.fps") != 10
             or video_info.get("video.codec") != "av1"
         ):
