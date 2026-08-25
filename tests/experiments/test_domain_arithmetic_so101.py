@@ -1,6 +1,8 @@
+import hashlib
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,11 +16,9 @@ from experiments.domain_arithmetic_so101.dart_merge import (
     merge_checkpoints,
     merge_tensor,
 )
-from experiments.domain_arithmetic_so101.prepare_target_dataset import (
-    canonicalize_joint_vector,
-    dataset_content_manifest,
-    image_for_writer,
-)
+from experiments.domain_arithmetic_so101 import prepare_target_dataset
+from experiments.domain_arithmetic_so101.prepare_target_dataset import dataset_content_manifest
+from experiments.domain_arithmetic_so101.prepare_target_dataset import validate_target_contract
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.lerobot_train import _use_dataset_processor_stats
@@ -36,32 +36,135 @@ def test_workflow_condition_paths(tmp_path: Path) -> None:
     assert result.stdout.strip() == "workflow condition paths OK"
 
 
-def test_old_gripper_convention_is_canonicalized_without_touching_arm_joints() -> None:
-    vector = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, -40.0])
-    converted = canonicalize_joint_vector(vector)
+def test_same_rig_target_contract_needs_no_interface_conversion() -> None:
+    joint_names = list(prepare_target_dataset.JOINT_NAMES)
+    joint_feature = {"dtype": "float32", "shape": [6], "names": joint_names}
+    camera_feature = {
+        "dtype": "video",
+        "shape": [480, 640, 3],
+        "info": {"video.fps": 10, "video.codec": "av1"},
+    }
+    meta = SimpleNamespace(
+        tasks=SimpleNamespace(index=[prepare_target_dataset.SOURCE_TASK]),
+        features={
+            "observation.state": joint_feature,
+            "action": joint_feature,
+            "observation.images.left_wrist": camera_feature,
+            "observation.images.top": camera_feature,
+        },
+        stats={
+            "observation.state": {"min": [0, 0, 0, 0, 0, 0.3], "max": [0, 0, 0, 0, 0, 36.3]},
+            "action": {"min": [0, 0, 0, 0, 0, 1.2], "max": [0, 0, 0, 0, 0, 36.8]},
+        },
+    )
 
-    assert torch.equal(converted[:5], vector[:5])
-    assert converted[-1].item() == 30.0
-    assert canonicalize_joint_vector(vector.index_put((torch.tensor([5]),), torch.tensor([-100.0])))[-1] == 0
-    assert canonicalize_joint_vector(vector.index_put((torch.tensor([5]),), torch.tensor([100.0])))[-1] == 100
+    class Target:
+        fps = 10
+        num_episodes = 1
+
+        def __init__(self) -> None:
+            self.meta = meta
+
+        def __len__(self) -> int:
+            return 300
+
+    validate_target_contract(Target())
+    assert prepare_target_dataset.SOURCE_REPO == "sungkyunner/record-test_20260825_225339"
+    assert prepare_target_dataset.SOURCE_REVISION == "97e2c1d4d49607210d1e63d46db2a43b530bdf89"
+    assert not hasattr(prepare_target_dataset, "canonicalize_joint_vector")
 
 
-def test_decoded_chw_image_is_prepared_for_hwc_writer() -> None:
-    image = torch.arange(3 * 4 * 5, dtype=torch.uint8).reshape(3, 4, 5)
-    prepared = image_for_writer(image, {"shape": (4, 5, 3)})
-    assert prepared.shape == (4, 5, 3)
-    assert prepared.is_contiguous()
-    assert torch.equal(prepared.permute(2, 0, 1), image)
-
-
-def test_target_content_manifest_is_sorted_and_excludes_itself(tmp_path: Path) -> None:
+def test_target_content_manifest_is_sorted(tmp_path: Path) -> None:
     (tmp_path / "z").write_bytes(b"z")
     (tmp_path / "a").write_bytes(b"a")
-    (tmp_path / "target_preparation.json").write_bytes(b"ignored")
     manifest = dataset_content_manifest(tmp_path)
 
     assert [file["path"] for file in manifest["files"]] == ["a", "z"]
     assert len(manifest["tree_sha256"]) == 64
+
+
+def _capture_uv(tmp_path: Path) -> tuple[Path, Path]:
+    capture = tmp_path / "uv-args"
+    binary = tmp_path / "uv"
+    binary.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "$CAPTURE"\n', encoding="utf-8")
+    binary.chmod(0o755)
+    return binary, capture
+
+
+def test_target_training_uses_pinned_hub_episode_and_frozen_loader_settings(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    _, capture = _capture_uv(tmp_path)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "target_provenance.json").write_text("{}\n", encoding="utf-8")
+    subprocess.run(
+        [script, "train-target"],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "RUN_ROOT": str(run_root),
+        },
+    )
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert "--dataset.repo_id=sungkyunner/record-test_20260825_225339" in args
+    assert "--dataset.revision=97e2c1d4d49607210d1e63d46db2a43b530bdf89" in args
+    assert "--dataset.episodes=[0]" in args
+    assert "--dataset.video_backend=pyav" in args
+    assert "--num_workers=0" in args
+    assert "--batch_size=8" in args
+    assert "--accelerator.gradient_accumulation.steps=8" in args
+
+
+def test_merge_accepts_verified_source_checkpoint_override(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    _, capture = _capture_uv(tmp_path)
+    run_root = tmp_path / "run"
+    source = tmp_path / "reused-source"
+    target = run_root / "target_finetune/checkpoints/last/pretrained_model"
+    source.mkdir(parents=True)
+    target.mkdir(parents=True)
+    (source / "model.safetensors").touch()
+    (target / "model.safetensors").touch()
+    subprocess.run(
+        [script, "merge"],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "RUN_ROOT": str(run_root),
+            "SOURCE_CHECKPOINT": str(source),
+        },
+    )
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert args.count(f"--source={source}") == 2
+
+
+def test_rollout_defaults_to_same_rig_rtc_and_forwards_extra_args(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "examples/smolvla/run_so101_pick_place.sh"
+    _, capture = _capture_uv(tmp_path)
+    subprocess.run(
+        [script, "--test-extra=value"],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "WRIST_CAMERA": "12",
+            "TOP_CAMERA": "10",
+        },
+    )
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert "--inference.type=rtc" in args
+    assert "--inference.rtc.execution_horizon=10" in args
+    assert "--inference.rtc.max_guidance_weight=10" in args
+    assert "--fps=10" in args
+    assert "fps: 30" in next(arg for arg in args if arg.startswith("--robot.cameras="))
+    assert "index_or_path: 12" in next(arg for arg in args if arg.startswith("--robot.cameras="))
+    assert "index_or_path: 10" in next(arg for arg in args if arg.startswith("--robot.cameras="))
+    assert args[-1] == "--test-extra=value"
 
 
 def _checkpoint(path: Path, tensors: dict[str, torch.Tensor], artifacts: bool = False) -> Path:
@@ -145,6 +248,10 @@ def test_native_output_preserves_base_processors(tmp_path: Path) -> None:
 
     assert set(load_file(output / "model.safetensors")) == set(tensors)
     assert metadata["tensor_count"] == len(tensors)
+    with (source / "model.safetensors").open("rb") as stream:
+        assert metadata["inputs"]["source"]["model_sha256"] == hashlib.file_digest(
+            stream, "sha256"
+        ).hexdigest()
     assert (output / "dart_merge.json").is_file()
     for name in BASE_ARTIFACTS:
         assert (output / name).read_bytes() == (base / name).read_bytes()

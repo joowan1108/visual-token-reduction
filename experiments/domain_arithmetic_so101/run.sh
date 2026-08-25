@@ -5,15 +5,25 @@ BASE="CoRL2026-CSI/smolvla_IsaacLab-SO101_pick_place_baseCaP_100epi_50ep-appendi
 BASE_REV="75d5905c5e27ba6f0a738cbcfcb167e7769dce0d"
 SOURCE_DATASET="CoRL2026-CSI/IsaacLab-SO101-PickAndPlace-100epi-10fps-appendix"
 SOURCE_REV="2b739e6be9b341e6359265ed99be81458ed4d879"
-TARGET_REPO_ID="skkuprism/test_pick_red_place_blue_50epi_10fps"
-TARGET_REV="e19331e77f477a4be16f7c2884250ed6f491e048"
+TARGET_REPO_ID="sungkyunner/record-test_20260825_225339"
+TARGET_REV="97e2c1d4d49607210d1e63d46db2a43b530bdf89"
+TARGET_EPISODE=0
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ROOT="${RUN_ROOT:-$HERE/artifacts}"
 SOURCE_OUTPUT="$RUN_ROOT/source_finetune"
 TARGET_OUTPUT="$RUN_ROOT/target_finetune"
-PREPARED_TARGET_REPO="local/domain-arithmetic-so101-target-canonical-ep0"
-PREPARED_TARGET_ROOT="$RUN_ROOT/target_canonical_ep0"
+TARGET_PROVENANCE="$RUN_ROOT/target_provenance.json"
+DEFAULT_SOURCE_CHECKPOINT="$SOURCE_OUTPUT/checkpoints/last/pretrained_model"
+SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-$DEFAULT_SOURCE_CHECKPOINT}"
 RENAME_MAP='{"observation.images.left_wrist":"observation.images.camera1","observation.images.top":"observation.images.camera2"}'
+
+require_absent() {
+  [[ ! -e "$1" ]] || { echo "refusing to overwrite $1; set a fresh RUN_ROOT" >&2; exit 2; }
+}
+
+require_checkpoint() {
+  [[ -f "$1/model.safetensors" ]] || { echo "missing checkpoint model.safetensors at $1" >&2; exit 2; }
+}
 
 condition_path() {
   case "$1" in
@@ -65,10 +75,12 @@ train_common=(
   --scheduler.num_warmup_steps=0
   --steps=1000
   --batch_size=8
+  --num_workers=0
   --accelerator.gradient_accumulation.steps=8
   --seed=1000
   --cudnn_deterministic=true
   --dataset.image_transforms.enable=false
+  --dataset.video_backend=pyav
   --save_freq=0
   --env_eval_freq=0
   --wandb.enable=false
@@ -85,7 +97,7 @@ case "${1:-}" in
     exec uv run lerobot-record \
       --robot.type=so101_follower --robot.port="${ROBOT_PORT:-/dev/ttyACM0}" --robot.id="${ROBOT_ID:-so101_follower}" \
       --robot.use_degrees=true \
-      --robot.cameras="{left_wrist: {type: opencv, index_or_path: ${WRIST_CAMERA:-0}, width: 640, height: 480, fps: 10}, top: {type: opencv, index_or_path: ${TOP_CAMERA:-2}, width: 640, height: 480, fps: 10}}" \
+      --robot.cameras="{left_wrist: {type: opencv, index_or_path: ${WRIST_CAMERA:-0}, width: 640, height: 480, fps: ${CAMERA_FPS:-30}}, top: {type: opencv, index_or_path: ${TOP_CAMERA:-2}, width: 640, height: 480, fps: ${CAMERA_FPS:-30}}}" \
       --teleop.type=so101_leader --teleop.port="${LEADER_PORT:-/dev/ttyACM1}" --teleop.id="${LEADER_ID:-so101_leader}" \
       --dataset.repo_id="$RECORD_REPO_ID" --dataset.root="$RECORD_DATASET_ROOT" \
       --dataset.no_stamp=true --dataset.push_to_hub=false --dataset.num_episodes=1 \
@@ -93,35 +105,48 @@ case "${1:-}" in
       --dataset.fps=10 --dataset.episode_time_s=30 --dataset.reset_time_s=10 --display_data=true
     ;;
   train-source)
+    require_absent "$SOURCE_OUTPUT"
     exec uv run lerobot-train "${train_common[@]}" \
       --dataset.repo_id="$SOURCE_DATASET" --dataset.revision="$SOURCE_REV" --dataset.episodes='[0]' \
       --output_dir="$SOURCE_OUTPUT" --job_name=dart_so101_source
     ;;
   prepare-target)
-    exec uv run "$HERE/prepare_target_dataset.py" --output="$PREPARED_TARGET_ROOT"
+    require_absent "$TARGET_PROVENANCE"
+    exec uv run "$HERE/prepare_target_dataset.py" --output="$TARGET_PROVENANCE"
     ;;
   train-target)
-    [[ -d "$PREPARED_TARGET_ROOT" ]] || { echo "run prepare-target first" >&2; exit 2; }
+    [[ -f "$TARGET_PROVENANCE" ]] || { echo "run prepare-target first" >&2; exit 2; }
+    require_absent "$TARGET_OUTPUT"
     exec uv run lerobot-train "${train_common[@]}" \
-      --dataset.repo_id="$PREPARED_TARGET_REPO" --dataset.root="$PREPARED_TARGET_ROOT" --dataset.episodes='[0]' \
+      --dataset.repo_id="$TARGET_REPO_ID" --dataset.revision="$TARGET_REV" \
+      --dataset.episodes="[$TARGET_EPISODE]" \
       --output_dir="$TARGET_OUTPUT" --job_name=dart_so101_target
     ;;
   merge)
+    require_checkpoint "$SOURCE_CHECKPOINT"
+    require_checkpoint "$TARGET_OUTPUT/checkpoints/last/pretrained_model"
+    require_absent "$RUN_ROOT/direct"
+    require_absent "$RUN_ROOT/dart"
     uv run "$HERE/dart_merge.py" --base="$BASE" --base-revision="$BASE_REV" \
-      --source="$SOURCE_OUTPUT/checkpoints/last/pretrained_model" \
+      --source="$SOURCE_CHECKPOINT" \
       --target="$TARGET_OUTPUT/checkpoints/last/pretrained_model" \
       --output="$RUN_ROOT/direct" --method=direct --alpha=0.8 --rank=256 --seed=42
     exec uv run "$HERE/dart_merge.py" --base="$BASE" --base-revision="$BASE_REV" \
-      --source="$SOURCE_OUTPUT/checkpoints/last/pretrained_model" \
+      --source="$SOURCE_CHECKPOINT" \
       --target="$TARGET_OUTPUT/checkpoints/last/pretrained_model" \
       --output="$RUN_ROOT/dart" --method=dart --alpha=0.8 --rank=256 --seed=42
     ;;
   adapt)
-    for output in "$PREPARED_TARGET_ROOT" "$SOURCE_OUTPUT" "$TARGET_OUTPUT" "$RUN_ROOT/direct" "$RUN_ROOT/dart"; do
-      [[ ! -e "$output" ]] || { echo "refusing to reuse $output; set a fresh RUN_ROOT" >&2; exit 2; }
+    for output in "$TARGET_PROVENANCE" "$TARGET_OUTPUT" "$RUN_ROOT/direct" "$RUN_ROOT/dart"; do
+      require_absent "$output"
     done
+    if [[ "$SOURCE_CHECKPOINT" == "$DEFAULT_SOURCE_CHECKPOINT" ]]; then
+      require_absent "$SOURCE_OUTPUT"
+    else
+      require_checkpoint "$SOURCE_CHECKPOINT"
+    fi
     "$HERE/run.sh" prepare-target
-    "$HERE/run.sh" train-source
+    [[ "$SOURCE_CHECKPOINT" != "$DEFAULT_SOURCE_CHECKPOINT" ]] || "$HERE/run.sh" train-source
     "$HERE/run.sh" train-target
     exec "$HERE/run.sh" merge
     ;;
@@ -148,10 +173,15 @@ case "${1:-}" in
       --dataset.fps=10 --dataset.episode_time_s=30 --dataset.reset_time_s=0
     ;;
   check)
-    [[ "$TARGET_REPO_ID" == "skkuprism/test_pick_red_place_blue_50epi_10fps" ]]
-    [[ "$TARGET_REV" == "e19331e77f477a4be16f7c2884250ed6f491e048" ]]
-    [[ "$PREPARED_TARGET_REPO" == "local/domain-arithmetic-so101-target-canonical-ep0" ]]
-    [[ "$PREPARED_TARGET_ROOT" == "$RUN_ROOT/target_canonical_ep0" ]]
+    [[ "$TARGET_REPO_ID" == "sungkyunner/record-test_20260825_225339" ]]
+    [[ "$TARGET_REV" == "97e2c1d4d49607210d1e63d46db2a43b530bdf89" ]]
+    [[ "$TARGET_EPISODE" == 0 ]]
+    [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]
+    [[ " ${train_common[*]} " == *" --steps=1000 "* ]]
+    [[ " ${train_common[*]} " == *" --batch_size=8 "* ]]
+    [[ " ${train_common[*]} " == *" --num_workers=0 "* ]]
+    [[ " ${train_common[*]} " == *" --accelerator.gradient_accumulation.steps=8 "* ]]
+    [[ " ${train_common[*]} " == *" --dataset.video_backend=pyav "* ]]
     [[ "$(condition_path Z)" == "$BASE" ]]
     [[ "$(condition_path F)" == "$TARGET_OUTPUT/checkpoints/last/pretrained_model" ]]
     [[ "$(condition_path A)" == "$RUN_ROOT/direct" ]]

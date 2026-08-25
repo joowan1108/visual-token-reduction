@@ -2,6 +2,7 @@
 """Merge one-shot source/target SmolVLA checkpoints with direct arithmetic or DArT."""
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -45,11 +46,14 @@ def _resolve(identifier: str, revision: str | None, *, base: bool = False) -> tu
     model = root / MODEL_FILE
     if not root.is_dir() or not model.is_file():
         raise FileNotFoundError(f"Expected one {MODEL_FILE} at {root}.")
+    with model.open("rb") as stream:
+        model_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
     return root, {
         "input": identifier,
         "requested_revision": revision,
         "resolved_revision": resolved_revision,
         "resolved_path": str(root),
+        "model_sha256": model_sha256,
     }
 
 

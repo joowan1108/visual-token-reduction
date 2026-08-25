@@ -119,3 +119,27 @@ No robot test is required for the merger. Hardware behavior is assessed only by 
 - The paper validates Pi0.5 and Pi0-FAST, not SmolVLA.
 - Using only the real demo without the matching source fine-tune is ordinary one-shot fine-tuning, not DArT.
 - Fixed base normalization and identical source/target interfaces are required for causal attribution.
+
+## Amendment 02 implementation map
+
+The new target dataset is already canonical and should be trained directly from its pinned Hub
+revision, episode `0`. It has one episode, 300 frames, 10 FPS, exact task text, two expected camera
+keys, six float32 state/action values in the source joint order, degree-valued arm joints, and a
+current-convention positive gripper range. Remove the old target materialization and
+`(old + 100) / 2` conversion rather than adapting it.
+
+Minimal changes:
+
+- pin `sungkyunner/record-test_20260825_225339@97e2c1d4d49607210d1e63d46db2a43b530bdf89`;
+- make `prepare-target` validate and hash the immutable episode without rewriting it;
+- train target directly with the pinned revision and `dataset.episodes=[0]`;
+- retain the wrist-to-`camera1` and top-to-`camera2` rename map;
+- force PyAV for the AV1 videos and use `num_workers=0` in the constrained remote container;
+- allow a verified existing source checkpoint to be supplied to merge, defaulting to the new run's
+  source output;
+- require a fresh run root for the new target/direct/DArT artifacts.
+
+The source checkpoint can be reused without retraining only when it was produced from the same
+pinned base revision and frozen source settings. Record its model hash. Minimum tests must verify
+the new repo/revision/episode contract, absence of gripper conversion, target command construction,
+source-checkpoint override, PyAV/worker flags, and unchanged merge validation.

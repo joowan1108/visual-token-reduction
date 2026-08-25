@@ -106,3 +106,24 @@ At minimum, evaluate:
 4. full DArT.
 
 Without the target one-shot baseline, improvement over the base cannot show that domain arithmetic is better than ordinary one-shot adaptation. Results are unsupported if source/target interfaces cannot remain identical, more than one real demonstration is used, or DArT does not improve the preregistered primary success measure.
+
+## Amendment 02 evidence: same-rig target demonstration
+
+The replacement target is pinned to
+[`sungkyunner/record-test_20260825_225339@97e2c1d4d49607210d1e63d46db2a43b530bdf89`](https://huggingface.co/datasets/sungkyunner/record-test_20260825_225339/tree/97e2c1d4d49607210d1e63d46db2a43b530bdf89).
+Its immutable metadata contains exactly one 300-frame episode at 10 FPS with the exact source task,
+six identically named degree-valued SO-101 joints, and 640x480 left-wrist/top videos. Manual review
+of both videos before retraining confirmed one complete successful red-block-to-blue-dish trajectory.
+
+This is closer to the paper's real-world protocol than the superseded other-rig demonstration:
+DArT uses one target demonstration collected in the target environment and the corresponding
+same-task source demonstration, with both updates independently initialized from the same base.
+The paper's real experiment likewise collected the target demonstration and evaluated on the same
+physical target setup. The evidence remains indirect because the paper evaluates Pi0.5/Pi0-FAST
+and mostly real-to-real viewpoint shifts, not SmolVLA sim-to-real transfer.
+
+The dataset already uses the current `[0, 100]` gripper convention and exact task string. The old
+gripper affine conversion must not be applied. Existing base and superseded-DArT hardware runs were
+observed before this replacement; they are disclosed infrastructure pilots only and cannot enter the
+confirmatory analysis. All new target, direct, and DArT artifacts and formal outcomes must come from
+a fresh amended run.
