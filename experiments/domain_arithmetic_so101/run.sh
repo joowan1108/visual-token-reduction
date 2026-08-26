@@ -15,6 +15,8 @@ TARGET_OUTPUT="$RUN_ROOT/target_finetune"
 TARGET_PROVENANCE="$RUN_ROOT/target_provenance.json"
 DEFAULT_SOURCE_CHECKPOINT="$SOURCE_OUTPUT/checkpoints/last/pretrained_model"
 SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-$DEFAULT_SOURCE_CHECKPOINT}"
+DEFAULT_TARGET_CHECKPOINT="$TARGET_OUTPUT/checkpoints/last/pretrained_model"
+TARGET_CHECKPOINT="${TARGET_CHECKPOINT:-$DEFAULT_TARGET_CHECKPOINT}"
 RENAME_MAP='{"observation.images.left_wrist":"observation.images.camera1","observation.images.top":"observation.images.camera2"}'
 
 require_absent() {
@@ -28,7 +30,7 @@ require_checkpoint() {
 condition_path() {
   case "$1" in
     Z) echo "$BASE" ;;
-    F) echo "$TARGET_OUTPUT/checkpoints/last/pretrained_model" ;;
+    F) echo "$TARGET_CHECKPOINT" ;;
     A) echo "$RUN_ROOT/direct" ;;
     D) echo "$RUN_ROOT/dart" ;;
     *) echo "condition must be one of Z, F, A, or D" >&2; return 2 ;;
@@ -124,17 +126,17 @@ case "${1:-}" in
     ;;
   merge)
     require_checkpoint "$SOURCE_CHECKPOINT"
-    require_checkpoint "$TARGET_OUTPUT/checkpoints/last/pretrained_model"
+    require_checkpoint "$TARGET_CHECKPOINT"
     require_absent "$RUN_ROOT/direct"
     require_absent "$RUN_ROOT/dart"
     uv run "$HERE/dart_merge.py" --base="$BASE" --base-revision="$BASE_REV" \
       --source="$SOURCE_CHECKPOINT" \
-      --target="$TARGET_OUTPUT/checkpoints/last/pretrained_model" \
-      --output="$RUN_ROOT/direct" --method=direct --alpha=0.8 --rank=256 --seed=42
+      --target="$TARGET_CHECKPOINT" \
+      --output="$RUN_ROOT/direct" --method=direct --alpha=0.8
     exec uv run "$HERE/dart_merge.py" --base="$BASE" --base-revision="$BASE_REV" \
       --source="$SOURCE_CHECKPOINT" \
-      --target="$TARGET_OUTPUT/checkpoints/last/pretrained_model" \
-      --output="$RUN_ROOT/dart" --method=dart --alpha=0.8 --rank=256 --seed=42
+      --target="$TARGET_CHECKPOINT" \
+      --output="$RUN_ROOT/dart" --method=dart --alpha=0.8
     ;;
   adapt)
     for output in "$TARGET_PROVENANCE" "$TARGET_OUTPUT" "$RUN_ROOT/direct" "$RUN_ROOT/dart"; do

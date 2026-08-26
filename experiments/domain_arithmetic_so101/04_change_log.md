@@ -60,3 +60,46 @@ rollout was run and no results were interpreted.
   Pi0-FAST implementation. No paper metric, seed, budget, comparison, or falsification rule changed.
 - Merge metadata records the resolved input path/revision and model SHA-256. External verification
   of the remaining source run configuration and processor hashes is still required before reuse.
+
+---
+
+# Change log: Amendment 03 exact-SVD sensitivity
+
+Date: 2026-08-26
+
+## Changed files
+
+- `dart_merge.py`: replaces rank-256 randomized SVD with exact thin SVD through
+  `torch.linalg.svd(..., full_matrices=False)`, retains every `min(m, n)` component, and removes
+  merge rank/seed parameters and metadata.
+- `run.sh`: removes obsolete merge rank/seed flags and accepts a verified `TARGET_CHECKPOINT`
+  override alongside `SOURCE_CHECKPOINT` for a merge-only fresh output root.
+- `README.md`: documents the merge-only source/target reuse workflow and system-RAM expectation.
+- `tests/experiments/test_domain_arithmetic_so101.py`: checks the full thin spectrum, exact-SVD
+  provenance, removed rank/seed flags, and both checkpoint overrides.
+
+## Configuration and commands
+
+- SVD: `torch.linalg.svd`, `full_matrices=false`, all thin-spectrum components retained.
+- Arithmetic: float32 CPU, `alpha=0.8`, target energy cutoff `0.9975`; unchanged 1-D direct
+  arithmetic, 4-D flatten/restore, zero-update skip, processor copy, and input SHA-256 metadata.
+- Training dataset, training seed `1000`, budgets, metrics, runtime, and evaluation criteria are
+  unchanged. No training is required for this amendment.
+
+```bash
+bash -n experiments/domain_arithmetic_so101/run.sh
+RUN_ROOT=/tmp/domain-arithmetic-check-$$ experiments/domain_arithmetic_so101/run.sh check
+uv run pytest tests/experiments/test_domain_arithmetic_so101.py -q --tb=short
+```
+
+Shell syntax, workflow check, and focused Ruff checks passed. Pytest was blocked during conftest
+import because the local PyTorch installation cannot load `libcublasLt.so.12`; no test body ran.
+
+## Assumptions and deviations
+
+- Source and target overrides must be the already verified Amendment 02 checkpoints. Exact-SVD
+  outputs use a fresh `RUN_ROOT`; prior randomized-SVD and direct artifacts are never overwritten.
+- This retains the SmolVLA per-tensor safetensors implementation rather than the paper's JAX/Pi
+  checkpoint loader. It is an outcome-informed exploratory sensitivity analysis as declared in
+  `03_amendment_03_exact_svd.md`, not a replacement for the preregistered D condition.
+- No experimental outcomes were run or interpreted during implementation.

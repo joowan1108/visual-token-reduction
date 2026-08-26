@@ -143,3 +143,13 @@ The source checkpoint can be reused without retraining only when it was produced
 pinned base revision and frozen source settings. Record its model hash. Minimum tests must verify
 the new repo/revision/episode contract, absence of gripper conversion, target command construction,
 source-checkpoint override, PyAV/worker flags, and unchanged merge validation.
+
+## Amendment 03 implementation map: exact thin SVD
+
+Keep the existing per-tensor safetensors loader, float32 arithmetic, zero-update skip, processor
+copy, input hashes, and merge validation. Replace the randomized range finder in `_left_svd` with
+`torch.linalg.svd(matrix, full_matrices=False)` and retain every returned left singular vector.
+Remove the now-misleading merge `rank` and `seed` parameters from Python, CLI, shell calls, and
+metadata; training seed 1000 remains unchanged. Record exact-SVD provenance in `dart_merge.json`
+and replace the randomized-SVD test with an exact-spectrum test. Exact outputs must use a fresh
+path and must not overwrite or relabel prior randomized artifacts.

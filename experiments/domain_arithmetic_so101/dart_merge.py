@@ -57,19 +57,9 @@ def _resolve(identifier: str, revision: str | None, *, base: bool = False) -> tu
     }
 
 
-def _left_svd(matrix: torch.Tensor, rank: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    min_dim = min(matrix.shape)
-    if min_dim <= rank:
-        u, s, _ = torch.linalg.svd(matrix, full_matrices=False)
-        return u, s
-
-    q_rank = min(rank + 10, min_dim)
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    q, _ = torch.linalg.qr(matrix @ torch.randn(matrix.shape[1], q_rank, generator=generator), mode="reduced")
-    for _ in range(4):
-        q, _ = torch.linalg.qr(matrix @ (matrix.T @ q), mode="reduced")
-    u_hat, s, _ = torch.linalg.svd(q.T @ matrix, full_matrices=False)
-    return (q @ u_hat)[:, :rank], s[:rank]
+def _left_svd(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    u, s, _ = torch.linalg.svd(matrix, full_matrices=False)
+    return u, s
 
 
 def _project(matrix: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
@@ -81,15 +71,13 @@ def dart_delta(
     target_update: torch.Tensor,
     *,
     alpha: float,
-    rank: int,
-    seed: int,
 ) -> torch.Tensor:
     """Apply Algorithm 1 to one `[out, in]` float32 update matrix."""
     if source_update.ndim != 2 or target_update.shape != source_update.shape:
         raise ValueError("DArT expects equal 2-D source and target updates.")
 
-    u_target, s_target = _left_svd(target_update, rank, seed)
-    u_source, _ = _left_svd(source_update, rank, seed + 1)
+    u_target, s_target = _left_svd(target_update)
+    u_source, _ = _left_svd(source_update)
 
     singular_energy = s_target.square()
     if singular_energy.sum() > 0:
@@ -129,8 +117,6 @@ def merge_tensor(
     *,
     method: str,
     alpha: float,
-    rank: int,
-    seed: int,
 ) -> tuple[torch.Tensor, bool]:
     source_update = source.float() - base.float()
     target_update = target.float() - base.float()
@@ -145,8 +131,6 @@ def merge_tensor(
             source_update.reshape(shape[0], -1),
             target_update.reshape(shape[0], -1),
             alpha=alpha,
-            rank=rank,
-            seed=seed,
         ).reshape(shape)
     return (base.float() + delta).to(base.dtype).contiguous(), False
 
@@ -159,8 +143,6 @@ def merge_checkpoints(
     *,
     method: str = "dart",
     alpha: float = 0.8,
-    rank: int = 256,
-    seed: int = 42,
     base_revision: str | None = None,
     source_revision: str | None = None,
     target_revision: str | None = None,
@@ -169,9 +151,6 @@ def merge_checkpoints(
         raise ValueError(f"Unknown method {method!r}.")
     if not math.isfinite(alpha):
         raise ValueError("alpha must be finite.")
-    if rank < 1 or seed < 0:
-        raise ValueError("rank must be positive and seed must be non-negative.")
-
     base_root, base_info = _resolve(base, base_revision, base=True)
     source_root, source_info = _resolve(source, source_revision)
     target_root, target_info = _resolve(target, target_revision)
@@ -195,7 +174,7 @@ def merge_checkpoints(
         if set(source_file.keys()) != base_keys or set(target_file.keys()) != base_keys:
             raise ValueError("Base, source, and target checkpoints must have identical key sets.")
 
-        for index, key in enumerate(sorted(base_keys)):
+        for key in sorted(base_keys):
             tensors = (base_file.get_tensor(key), source_file.get_tensor(key), target_file.get_tensor(key))
             if tensors[0].shape != tensors[1].shape or tensors[0].shape != tensors[2].shape:
                 raise ValueError(f"Shape mismatch for {key!r}: {[tuple(t.shape) for t in tensors]}.")
@@ -210,17 +189,20 @@ def merge_checkpoints(
                 *tensors,
                 method=method,
                 alpha=alpha,
-                rank=rank,
-                seed=seed + index * 2,
             )
             zero_updates += unchanged
 
     metadata = {
         "method": method,
         "alpha": alpha,
-        "rank": rank,
-        "seed": seed,
         "energy_cutoff": ENERGY_CUTOFF,
+        "svd": {
+            "implementation": "torch.linalg.svd",
+            "full_matrices": False,
+            "retained_components": "all",
+        }
+        if method == "dart"
+        else None,
         "inputs": {"base": base_info, "source": source_info, "target": target_info},
         "tensor_count": len(merged),
         "tensor_counts_by_rank": counts,
@@ -245,8 +227,6 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--method", choices=("direct", "dart"), default="dart")
     parser.add_argument("--alpha", type=float, default=0.8)
-    parser.add_argument("--rank", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--base-revision")
     parser.add_argument("--source-revision")
     parser.add_argument("--target-revision")

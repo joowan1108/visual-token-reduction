@@ -28,6 +28,11 @@ episode 0. `train-target` reads the pinned Hub dataset directly. The
 optional `record` command is not part of this pinned run; it always writes to a separate local
 dataset and refuses the public target repo ID.
 
+DArT merge now uses exact economy SVD (`torch.linalg.svd(..., full_matrices=False)`) and retains
+the complete thin spectrum. This is the exploratory Amendment 03 condition, not the original
+rank-256 randomized-SVD condition. The merge remains float32 and per tensor on CPU; use at least
+16 GB system RAM and preserve the earlier merge artifacts under their original paths.
+
 To reuse a previously verified source checkpoint, keep the replacement outputs in a fresh
 `RUN_ROOT` and pass its local checkpoint directory only to merge:
 
@@ -61,6 +66,25 @@ test -f "$SOURCE_CHECKPOINT/model.safetensors"
 Unset `SOURCE_CHECKPOINT` and insert `train-source` before `train-target` when the prior source
 checkpoint has not been verified against the frozen base, optimizer, step, processor, and model
 hashes.
+
+To run only the exact-SVD merge without retraining either checkpoint, point both overrides at the
+verified prior outputs and choose a fresh output root:
+
+```bash
+export PRIOR_RUN_ROOT=/visual-token-reduction/experiments/domain_arithmetic_so101/artifacts/same_rig_ep0_run1
+export SOURCE_CHECKPOINT=/visual-token-reduction/experiments/domain_arithmetic_so101/artifacts/public_ep0_gpu_run1/source_finetune/checkpoints/last/pretrained_model
+export TARGET_CHECKPOINT="$PRIOR_RUN_ROOT/target_finetune/checkpoints/last/pretrained_model"
+export RUN_ROOT=/visual-token-reduction/experiments/domain_arithmetic_so101/artifacts/exact_svd_merge_run1
+
+test -f "$SOURCE_CHECKPOINT/model.safetensors"
+test -f "$TARGET_CHECKPOINT/model.safetensors"
+test ! -e "$RUN_ROOT/direct"
+test ! -e "$RUN_ROOT/dart"
+/usr/bin/time -v ./experiments/domain_arithmetic_so101/run.sh merge
+```
+
+The exact result is `$RUN_ROOT/dart`; `$RUN_ROOT/direct` is the unchanged arithmetic control.
+`dart_merge.json` records the exact SVD implementation and all input model hashes.
 
 ## Connected-hardware rollout
 

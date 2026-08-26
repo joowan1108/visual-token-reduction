@@ -8,6 +8,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from experiments.domain_arithmetic_so101 import prepare_target_dataset
 from experiments.domain_arithmetic_so101.dart_merge import (
     BASE_ARTIFACTS,
     ENERGY_CUTOFF,
@@ -16,9 +17,10 @@ from experiments.domain_arithmetic_so101.dart_merge import (
     merge_checkpoints,
     merge_tensor,
 )
-from experiments.domain_arithmetic_so101 import prepare_target_dataset
-from experiments.domain_arithmetic_so101.prepare_target_dataset import dataset_content_manifest
-from experiments.domain_arithmetic_so101.prepare_target_dataset import validate_target_contract
+from experiments.domain_arithmetic_so101.prepare_target_dataset import (
+    dataset_content_manifest,
+    validate_target_contract,
+)
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.lerobot_train import _use_dataset_processor_stats
@@ -117,12 +119,12 @@ def test_target_training_uses_pinned_hub_episode_and_frozen_loader_settings(tmp_
     assert "--accelerator.gradient_accumulation.steps=8" in args
 
 
-def test_merge_accepts_verified_source_checkpoint_override(tmp_path: Path) -> None:
+def test_merge_accepts_verified_checkpoint_overrides_and_exact_svd(tmp_path: Path) -> None:
     script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
     _, capture = _capture_uv(tmp_path)
     run_root = tmp_path / "run"
     source = tmp_path / "reused-source"
-    target = run_root / "target_finetune/checkpoints/last/pretrained_model"
+    target = tmp_path / "reused-target"
     source.mkdir(parents=True)
     target.mkdir(parents=True)
     (source / "model.safetensors").touch()
@@ -136,10 +138,13 @@ def test_merge_accepts_verified_source_checkpoint_override(tmp_path: Path) -> No
             "CAPTURE": str(capture),
             "RUN_ROOT": str(run_root),
             "SOURCE_CHECKPOINT": str(source),
+            "TARGET_CHECKPOINT": str(target),
         },
     )
     args = capture.read_text(encoding="utf-8").splitlines()
     assert args.count(f"--source={source}") == 2
+    assert args.count(f"--target={target}") == 2
+    assert not any(arg.startswith(("--rank=", "--seed=")) for arg in args)
 
 
 def test_rollout_defaults_to_same_rig_rtc_and_forwards_extra_args(tmp_path: Path) -> None:
@@ -195,35 +200,35 @@ def test_tensor_arithmetic_and_literal_dart() -> None:
     base = torch.tensor([1.0, 2.0])
     source = torch.tensor([2.0, 4.0])
     target = torch.tensor([4.0, 8.0])
-    actual, _ = merge_tensor(base, source, target, method="dart", alpha=0.5, rank=256, seed=42)
+    actual, _ = merge_tensor(base, source, target, method="dart", alpha=0.5)
     torch.testing.assert_close(actual, torch.tensor([2.0, 4.0]), rtol=0, atol=0)
 
     source_update = torch.tensor([[2.0, 0.2], [0.1, 1.0], [0.4, -0.3]])
     target_update = torch.tensor([[1.2, 0.7], [0.5, 1.8], [-0.2, 0.9]])
     torch.testing.assert_close(
-        dart_delta(source_update, target_update, alpha=0.8, rank=256, seed=42),
+        dart_delta(source_update, target_update, alpha=0.8),
         _literal_dart(source_update, target_update, 0.8),
     )
 
 
 def test_zero_update_is_bitwise_base() -> None:
     base = torch.tensor([[1.0, -2.0]], dtype=torch.float16)
-    merged, unchanged = merge_tensor(base, base, base, method="dart", alpha=0.8, rank=256, seed=42)
+    merged, unchanged = merge_tensor(base, base, base, method="dart", alpha=0.8)
     assert unchanged
     assert torch.equal(merged, base)
 
 
-def test_randomized_svd_is_seeded_and_finite() -> None:
+def test_exact_svd_retains_the_full_thin_spectrum() -> None:
     matrix = torch.randn(30, 25, generator=torch.Generator().manual_seed(7))
-    first_u, first_s = _left_svd(matrix, rank=4, seed=42)
-    second_u, second_s = _left_svd(matrix, rank=4, seed=42)
+    actual_u, actual_s = _left_svd(matrix)
+    expected_u, expected_s, _ = torch.linalg.svd(matrix, full_matrices=False)
 
-    assert first_u.shape == (30, 4)
-    assert first_s.shape == (4,)
-    assert torch.isfinite(first_u).all() and torch.isfinite(first_s).all()
-    torch.testing.assert_close(first_u, second_u, rtol=0, atol=0)
-    torch.testing.assert_close(first_s, second_s, rtol=0, atol=0)
-    torch.testing.assert_close(first_u.T @ first_u, torch.eye(4), rtol=1e-5, atol=1e-5)
+    assert actual_u.shape == (30, 25)
+    assert actual_s.shape == (25,)
+    assert torch.isfinite(actual_u).all() and torch.isfinite(actual_s).all()
+    torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
+    torch.testing.assert_close(actual_u.T @ actual_u, torch.eye(25), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual_u @ actual_u.T, expected_u @ expected_u.T, rtol=1e-5, atol=1e-5)
 
 
 def test_checkpoint_mismatches_raise(tmp_path: Path) -> None:
@@ -244,10 +249,16 @@ def test_native_output_preserves_base_processors(tmp_path: Path) -> None:
     source = _checkpoint(tmp_path / "source", {key: value + 1 for key, value in tensors.items()})
     target = _checkpoint(tmp_path / "target", {key: value + 2 for key, value in tensors.items()})
     output = tmp_path / "merged"
-    metadata = merge_checkpoints(str(base), str(source), str(target), output, method="direct")
+    metadata = merge_checkpoints(str(base), str(source), str(target), output, method="dart")
 
     assert set(load_file(output / "model.safetensors")) == set(tensors)
     assert metadata["tensor_count"] == len(tensors)
+    assert metadata["svd"] == {
+        "implementation": "torch.linalg.svd",
+        "full_matrices": False,
+        "retained_components": "all",
+    }
+    assert "rank" not in metadata and "seed" not in metadata
     with (source / "model.safetensors").open("rb") as stream:
         assert metadata["inputs"]["source"]["model_sha256"] == hashlib.file_digest(
             stream, "sha256"

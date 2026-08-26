@@ -127,3 +127,13 @@ gripper affine conversion must not be applied. Existing base and superseded-DArT
 observed before this replacement; they are disclosed infrastructure pilots only and cannot enter the
 confirmatory analysis. All new target, direct, and DArT artifacts and formal outcomes must come from
 a fresh amended run.
+
+## Amendment 03 evidence: exact thin SVD
+
+The paper's primary algorithm and released `domain_arithmetic/dart.py` use exact economy/thin SVD
+(`full_matrices=False`) and retain all `min(m, n)` components before DArT's 99.75%-energy filter.
+Appendix Table 8 reports 79.1% average success and 15m35s merge time for exact SVD versus 78.7%
+and 6m33s for rank-256 randomized SVD on Pi0.5 LIBERO viewpoint shifts. The reported +0.4-point
+average difference has no uncertainty analysis and is indirect for SmolVLA sim-to-real transfer.
+Exact SVD therefore improves implementation fidelity but is not evidence that it will rescue the
+observed failures of direct arithmetic or randomized-SVD DArT.
