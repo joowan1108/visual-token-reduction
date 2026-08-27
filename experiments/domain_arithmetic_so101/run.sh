@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="CoRL2026-CSI/smolvla_IsaacLab-SO101_pick_place_baseCaP_100epi_50ep-appendix"
-BASE_REV="75d5905c5e27ba6f0a738cbcfcb167e7769dce0d"
-SOURCE_DATASET="CoRL2026-CSI/IsaacLab-SO101-PickAndPlace-100epi-10fps-appendix"
-SOURCE_REV="2b739e6be9b341e6359265ed99be81458ed4d879"
-TARGET_REPO_ID="sungkyunner/record-test_20260825_225339"
-TARGET_REV="97e2c1d4d49607210d1e63d46db2a43b530bdf89"
-TARGET_EPISODE=0
+BASE="Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod"
+BASE_REV="45f76f173c76c4e002131f8b48e345589a071d0f"
+SOURCE_DATASET="Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
+SOURCE_REV="09a0376348f60be89edcbc0eb76c3e26b5f3b094"
+SOURCE_EPISODE=170
+DEFAULT_TARGET_REPO_ID="sungkyunner/record-test_20260826_210214"
+DEFAULT_TARGET_REV="295e6def6cb4df454f58894caea10c15446dc4e4"
+DEFAULT_TARGET_EPISODE=0
+TARGET_REPO_ID="${TARGET_REPO_ID:-$DEFAULT_TARGET_REPO_ID}"
+TARGET_REV="${TARGET_REV:-$DEFAULT_TARGET_REV}"
+TARGET_EPISODE="${TARGET_EPISODE:-$DEFAULT_TARGET_EPISODE}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ROOT="${RUN_ROOT:-$HERE/artifacts}"
 SOURCE_OUTPUT="$RUN_ROOT/source_finetune"
 TARGET_OUTPUT="$RUN_ROOT/target_finetune"
 TARGET_PROVENANCE="$RUN_ROOT/target_provenance.json"
-DEFAULT_SOURCE_CHECKPOINT="$SOURCE_OUTPUT/checkpoints/last/pretrained_model"
-SOURCE_CHECKPOINT="${SOURCE_CHECKPOINT:-$DEFAULT_SOURCE_CHECKPOINT}"
-DEFAULT_TARGET_CHECKPOINT="$TARGET_OUTPUT/checkpoints/last/pretrained_model"
-TARGET_CHECKPOINT="${TARGET_CHECKPOINT:-$DEFAULT_TARGET_CHECKPOINT}"
+SOURCE_CHECKPOINT="$SOURCE_OUTPUT/checkpoints/last/pretrained_model"
+TARGET_CHECKPOINT="$TARGET_OUTPUT/checkpoints/last/pretrained_model"
 RENAME_MAP='{"observation.images.left_wrist":"observation.images.camera1","observation.images.top":"observation.images.camera2"}'
 
 require_absent() {
@@ -25,6 +27,21 @@ require_absent() {
 
 require_checkpoint() {
   [[ -f "$1/model.safetensors" ]] || { echo "missing checkpoint model.safetensors at $1" >&2; exit 2; }
+}
+
+require_target_coordinates() {
+  [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "TARGET_REV must be an immutable 40-character lowercase commit SHA" >&2
+    exit 2
+  }
+  [[ "$TARGET_EPISODE" =~ ^[0-9]+$ ]] || { echo "TARGET_EPISODE must be a nonnegative integer" >&2; exit 2; }
+}
+
+require_visual_match() {
+  [[ "${VISUAL_MATCH_CONFIRMED:-}" == 1 ]] || {
+    echo "visually match source episode 170 and the target layout, then set VISUAL_MATCH_CONFIRMED=1" >&2
+    exit 2
+  }
 }
 
 condition_path() {
@@ -107,17 +124,27 @@ case "${1:-}" in
       --dataset.fps=10 --dataset.episode_time_s=30 --dataset.reset_time_s=10 --display_data=true
     ;;
   train-source)
+    require_visual_match
     require_absent "$SOURCE_OUTPUT"
     exec uv run lerobot-train "${train_common[@]}" \
-      --dataset.repo_id="$SOURCE_DATASET" --dataset.revision="$SOURCE_REV" --dataset.episodes='[0]' \
+      --dataset.repo_id="$SOURCE_DATASET" --dataset.revision="$SOURCE_REV" --dataset.episodes="[$SOURCE_EPISODE]" \
       --output_dir="$SOURCE_OUTPUT" --job_name=dart_so101_source
     ;;
   prepare-target)
+    require_target_coordinates
+    require_visual_match
     require_absent "$TARGET_PROVENANCE"
-    exec uv run "$HERE/prepare_target_dataset.py" --output="$TARGET_PROVENANCE"
+    exec uv run "$HERE/prepare_target_dataset.py" \
+      --repo-id="$TARGET_REPO_ID" --revision="$TARGET_REV" --episode="$TARGET_EPISODE" \
+      --visual-match-confirmed --output="$TARGET_PROVENANCE"
     ;;
   train-target)
+    require_target_coordinates
+    require_visual_match
     [[ -f "$TARGET_PROVENANCE" ]] || { echo "run prepare-target first" >&2; exit 2; }
+    uv run "$HERE/prepare_target_dataset.py" \
+      --repo-id="$TARGET_REPO_ID" --revision="$TARGET_REV" --episode="$TARGET_EPISODE" \
+      --verify-provenance="$TARGET_PROVENANCE"
     require_absent "$TARGET_OUTPUT"
     exec uv run lerobot-train "${train_common[@]}" \
       --dataset.repo_id="$TARGET_REPO_ID" --dataset.revision="$TARGET_REV" \
@@ -139,16 +166,11 @@ case "${1:-}" in
       --output="$RUN_ROOT/dart" --method=dart --alpha=0.8
     ;;
   adapt)
-    for output in "$TARGET_PROVENANCE" "$TARGET_OUTPUT" "$RUN_ROOT/direct" "$RUN_ROOT/dart"; do
+    for output in "$SOURCE_OUTPUT" "$TARGET_PROVENANCE" "$TARGET_OUTPUT" "$RUN_ROOT/direct" "$RUN_ROOT/dart"; do
       require_absent "$output"
     done
-    if [[ "$SOURCE_CHECKPOINT" == "$DEFAULT_SOURCE_CHECKPOINT" ]]; then
-      require_absent "$SOURCE_OUTPUT"
-    else
-      require_checkpoint "$SOURCE_CHECKPOINT"
-    fi
     "$HERE/run.sh" prepare-target
-    [[ "$SOURCE_CHECKPOINT" != "$DEFAULT_SOURCE_CHECKPOINT" ]] || "$HERE/run.sh" train-source
+    "$HERE/run.sh" train-source
     "$HERE/run.sh" train-target
     exec "$HERE/run.sh" merge
     ;;
@@ -175,9 +197,15 @@ case "${1:-}" in
       --dataset.fps=10 --dataset.episode_time_s=30 --dataset.reset_time_s=0
     ;;
   check)
-    [[ "$TARGET_REPO_ID" == "sungkyunner/record-test_20260825_225339" ]]
-    [[ "$TARGET_REV" == "97e2c1d4d49607210d1e63d46db2a43b530bdf89" ]]
-    [[ "$TARGET_EPISODE" == 0 ]]
+    [[ "$BASE" == "Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod" ]]
+    [[ "$BASE_REV" == "45f76f173c76c4e002131f8b48e345589a071d0f" ]]
+    [[ "$SOURCE_DATASET" == "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps" ]]
+    [[ "$SOURCE_REV" == "09a0376348f60be89edcbc0eb76c3e26b5f3b094" ]]
+    [[ "$SOURCE_EPISODE" == 170 ]]
+    [[ "$DEFAULT_TARGET_REPO_ID" == "sungkyunner/record-test_20260826_210214" ]]
+    [[ "$DEFAULT_TARGET_REV" == "295e6def6cb4df454f58894caea10c15446dc4e4" ]]
+    [[ "$DEFAULT_TARGET_EPISODE" == 0 ]]
+    require_target_coordinates
     [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]
     [[ " ${train_common[*]} " == *" --steps=1000 "* ]]
     [[ " ${train_common[*]} " == *" --batch_size=8 "* ]]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Validate and hash the pinned same-rig target episode without rewriting it."""
+"""Validate and hash one immutable Experiment M target episode without rewriting it."""
 
 import argparse
 import hashlib
@@ -9,11 +9,13 @@ from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-SOURCE_REPO = "sungkyunner/record-test_20260825_225339"
-SOURCE_REVISION = "97e2c1d4d49607210d1e63d46db2a43b530bdf89"
-SOURCE_EPISODE = 0
-SOURCE_TASK = "Pick up the red block and place it on the blue dish."
-EXPECTED_FRAMES = 300
+DEFAULT_TARGET_REPO = "sungkyunner/record-test_20260826_210214"
+DEFAULT_TARGET_REVISION = "295e6def6cb4df454f58894caea10c15446dc4e4"
+DEFAULT_TARGET_EPISODE = 0
+MATCHED_SOURCE_DATASET = "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
+MATCHED_SOURCE_REVISION = "09a0376348f60be89edcbc0eb76c3e26b5f3b094"
+MATCHED_SOURCE_EPISODE = 170
+TARGET_TASK = "Pick up the red block and place it on the blue dish."
 CAMERA_KEYS = ("observation.images.left_wrist", "observation.images.top")
 JOINT_NAMES = (
     "shoulder_pan.pos",
@@ -25,9 +27,10 @@ JOINT_NAMES = (
 )
 
 
-def dataset_content_manifest(root: Path) -> dict:
+def dataset_content_manifest(root: Path, relative_paths: list[Path] | None = None) -> dict:
     files = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    paths = root.rglob("*") if relative_paths is None else (root / path for path in relative_paths)
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
         if not path.is_file():
             continue
         digest = hashlib.sha256()
@@ -49,12 +52,12 @@ def dataset_content_manifest(root: Path) -> dict:
 
 
 def validate_target_contract(source: LeRobotDataset) -> None:
-    if source.fps != 10 or source.num_episodes != 1 or len(source) != EXPECTED_FRAMES:
+    if source.fps != 10 or source.num_episodes != 1 or len(source) == 0:
         raise ValueError(
-            f"Pinned target must be one {EXPECTED_FRAMES}-frame episode at 10 FPS; "
+            "Target selection must be exactly one nonempty episode at 10 FPS; "
             f"got {source.num_episodes=} {len(source)=} {source.fps=}."
         )
-    if list(source.meta.tasks.index) != [SOURCE_TASK]:
+    if list(source.meta.tasks.index) != [TARGET_TASK]:
         raise ValueError(f"Unexpected task table: {list(source.meta.tasks.index)!r}.")
 
     for key in (OBS_STATE, ACTION):
@@ -75,32 +78,67 @@ def validate_target_contract(source: LeRobotDataset) -> None:
             feature.get("dtype") != "video"
             or tuple(feature.get("shape") or ()) != (480, 640, 3)
             or video_info.get("video.fps") != 10
-            or video_info.get("video.codec") != "av1"
         ):
-            raise ValueError(f"Unexpected pinned camera feature {key}: {feature!r}.")
+            raise ValueError(f"Unexpected target camera feature {key}: {feature!r}.")
 
 
-def prepare_target_dataset(output: Path) -> None:
+def validate_target_provenance(path: Path, repo_id: str, revision: str, episode: int) -> None:
+    with path.open(encoding="utf-8") as stream:
+        provenance = json.load(stream)
+    expected = {
+        "target_repo": repo_id,
+        "target_revision": revision,
+        "target_episode": episode,
+        "visual_match_confirmed": True,
+        "matched_source_dataset": MATCHED_SOURCE_DATASET,
+        "matched_source_revision": MATCHED_SOURCE_REVISION,
+        "matched_source_episode": MATCHED_SOURCE_EPISODE,
+    }
+    actual = {key: provenance.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(f"Target provenance does not match this run: expected {expected!r}, got {actual!r}.")
+
+
+def prepare_target_dataset(
+    output: Path,
+    repo_id: str,
+    revision: str,
+    episode: int,
+    visual_match_confirmed: bool,
+) -> None:
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite target provenance {output}.")
+    if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
+        raise ValueError("Target revision must be an immutable 40-character lowercase commit SHA.")
+    if episode < 0:
+        raise ValueError("Target episode must be nonnegative.")
+    if not visual_match_confirmed:
+        raise ValueError("Visual source/target layout match must be confirmed before preparation.")
 
     source = LeRobotDataset(
-        SOURCE_REPO,
-        revision=SOURCE_REVISION,
-        episodes=[SOURCE_EPISODE],
+        repo_id,
+        revision=revision,
+        episodes=[episode],
         video_backend="pyav",
     )
     validate_target_contract(source)
+    selected_paths = [Path(path) for path in source.reader.get_episodes_file_paths()]
+    content_manifest = dataset_content_manifest(source.root, selected_paths)
     provenance = {
-        "source_repo": SOURCE_REPO,
-        "source_revision": SOURCE_REVISION,
-        "source_episode": SOURCE_EPISODE,
-        "source_frames": EXPECTED_FRAMES,
-        "source_fps": 10,
-        "source_task": SOURCE_TASK,
+        "target_repo": repo_id,
+        "target_revision": revision,
+        "target_episode": episode,
+        "visual_match_confirmed": True,
+        "matched_source_dataset": MATCHED_SOURCE_DATASET,
+        "matched_source_revision": MATCHED_SOURCE_REVISION,
+        "matched_source_episode": MATCHED_SOURCE_EPISODE,
+        "selected_frames": len(source),
+        "target_fps": source.fps,
+        "target_task": TARGET_TASK,
         "features": [OBS_STATE, ACTION, *CAMERA_KEYS],
         "conversions": [],
-        "content_manifest": dataset_content_manifest(source.root),
+        "selected_content_sha256": content_manifest["tree_sha256"],
+        "content_manifest": content_manifest,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as stream:
@@ -110,8 +148,25 @@ def prepare_target_dataset(output: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    prepare_target_dataset(parser.parse_args().output)
+    parser.add_argument("--repo-id", default=DEFAULT_TARGET_REPO)
+    parser.add_argument("--revision", default=DEFAULT_TARGET_REVISION)
+    parser.add_argument("--episode", type=int, default=DEFAULT_TARGET_EPISODE)
+    parser.add_argument("--visual-match-confirmed", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--verify-provenance", type=Path)
+    args = parser.parse_args()
+    if args.verify_provenance is not None:
+        validate_target_provenance(args.verify_provenance, args.repo_id, args.revision, args.episode)
+    elif args.output is not None:
+        prepare_target_dataset(
+            args.output,
+            args.repo_id,
+            args.revision,
+            args.episode,
+            args.visual_match_confirmed,
+        )
+    else:
+        parser.error("one of --output or --verify-provenance is required")
 
 
 if __name__ == "__main__":

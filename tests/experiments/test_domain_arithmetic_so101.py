@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -20,6 +21,7 @@ from experiments.domain_arithmetic_so101.dart_merge import (
 from experiments.domain_arithmetic_so101.prepare_target_dataset import (
     dataset_content_manifest,
     validate_target_contract,
+    validate_target_provenance,
 )
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -38,16 +40,16 @@ def test_workflow_condition_paths(tmp_path: Path) -> None:
     assert result.stdout.strip() == "workflow condition paths OK"
 
 
-def test_same_rig_target_contract_needs_no_interface_conversion() -> None:
+def _target_fixture(frame_count: int = 300) -> object:
     joint_names = list(prepare_target_dataset.JOINT_NAMES)
     joint_feature = {"dtype": "float32", "shape": [6], "names": joint_names}
     camera_feature = {
         "dtype": "video",
         "shape": [480, 640, 3],
-        "info": {"video.fps": 10, "video.codec": "av1"},
+        "info": {"video.fps": 10, "video.codec": "any-supported-codec"},
     }
     meta = SimpleNamespace(
-        tasks=SimpleNamespace(index=[prepare_target_dataset.SOURCE_TASK]),
+        tasks=SimpleNamespace(index=[prepare_target_dataset.TARGET_TASK]),
         features={
             "observation.state": joint_feature,
             "action": joint_feature,
@@ -66,14 +68,27 @@ def test_same_rig_target_contract_needs_no_interface_conversion() -> None:
 
         def __init__(self) -> None:
             self.meta = meta
+            self.reader = SimpleNamespace(get_episodes_file_paths=lambda: ["selected.bin"])
 
         def __len__(self) -> int:
-            return 300
+            return frame_count
 
-    validate_target_contract(Target())
-    assert prepare_target_dataset.SOURCE_REPO == "sungkyunner/record-test_20260825_225339"
-    assert prepare_target_dataset.SOURCE_REVISION == "97e2c1d4d49607210d1e63d46db2a43b530bdf89"
+    return Target()
+
+
+def test_experiment_m_target_contract_needs_no_interface_or_codec_conversion() -> None:
+    validate_target_contract(_target_fixture())
+    assert prepare_target_dataset.DEFAULT_TARGET_REPO == "sungkyunner/record-test_20260826_210214"
+    assert (
+        prepare_target_dataset.DEFAULT_TARGET_REVISION
+        == "295e6def6cb4df454f58894caea10c15446dc4e4"
+    )
     assert not hasattr(prepare_target_dataset, "canonicalize_joint_vector")
+
+
+def test_target_contract_rejects_an_empty_selected_episode() -> None:
+    with pytest.raises(ValueError, match="nonempty"):
+        validate_target_contract(_target_fixture(frame_count=0))
 
 
 def test_target_content_manifest_is_sorted(tmp_path: Path) -> None:
@@ -85,6 +100,55 @@ def test_target_content_manifest_is_sorted(tmp_path: Path) -> None:
     assert len(manifest["tree_sha256"]) == 64
 
 
+def test_target_provenance_records_selected_coordinates_and_hash(tmp_path: Path, monkeypatch) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "selected.bin").write_bytes(b"selected episode")
+    target = _target_fixture(frame_count=17)
+    target.root = dataset_root
+    monkeypatch.setattr(prepare_target_dataset, "LeRobotDataset", lambda *args, **kwargs: target)
+    output = tmp_path / "provenance.json"
+
+    prepare_target_dataset.prepare_target_dataset(
+        output,
+        "owner/target",
+        "a" * 40,
+        2,
+        True,
+    )
+
+    provenance = json.loads(output.read_text(encoding="utf-8"))
+    assert provenance["target_repo"] == "owner/target"
+    assert provenance["target_revision"] == "a" * 40
+    assert provenance["target_episode"] == 2
+    assert provenance["visual_match_confirmed"] is True
+    assert (
+        provenance["matched_source_dataset"]
+        == "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
+    )
+    assert provenance["matched_source_revision"] == "09a0376348f60be89edcbc0eb76c3e26b5f3b094"
+    assert provenance["matched_source_episode"] == 170
+    assert provenance["selected_frames"] == 17
+    assert provenance["selected_content_sha256"] == provenance["content_manifest"]["tree_sha256"]
+    validate_target_provenance(output, "owner/target", "a" * 40, 2)
+
+    provenance["target_episode"] = 3
+    output.write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match this run"):
+        validate_target_provenance(output, "owner/target", "a" * 40, 2)
+
+
+def test_target_preparation_requires_visual_confirmation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must be confirmed"):
+        prepare_target_dataset.prepare_target_dataset(
+            tmp_path / "provenance.json",
+            "owner/target",
+            "a" * 40,
+            2,
+            False,
+        )
+
+
 def _capture_uv(tmp_path: Path) -> tuple[Path, Path]:
     capture = tmp_path / "uv-args"
     binary = tmp_path / "uv"
@@ -93,7 +157,29 @@ def _capture_uv(tmp_path: Path) -> tuple[Path, Path]:
     return binary, capture
 
 
-def test_target_training_uses_pinned_hub_episode_and_frozen_loader_settings(tmp_path: Path) -> None:
+def test_source_training_uses_experiment_m_anchor_and_episode_170(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    _, capture = _capture_uv(tmp_path)
+    subprocess.run(
+        [script, "train-source"],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "RUN_ROOT": str(tmp_path / "run"),
+            "VISUAL_MATCH_CONFIRMED": "1",
+        },
+    )
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert "--policy.path=Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod" in args
+    assert "--policy.pretrained_revision=45f76f173c76c4e002131f8b48e345589a071d0f" in args
+    assert "--dataset.repo_id=Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps" in args
+    assert "--dataset.revision=09a0376348f60be89edcbc0eb76c3e26b5f3b094" in args
+    assert "--dataset.episodes=[170]" in args
+
+
+def test_target_training_uses_same_anchor_and_configurable_immutable_episode(tmp_path: Path) -> None:
     script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
     _, capture = _capture_uv(tmp_path)
     run_root = tmp_path / "run"
@@ -107,24 +193,49 @@ def test_target_training_uses_pinned_hub_episode_and_frozen_loader_settings(tmp_
             "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
             "CAPTURE": str(capture),
             "RUN_ROOT": str(run_root),
+            "TARGET_REPO_ID": "owner/real-target",
+            "TARGET_REV": "a" * 40,
+            "TARGET_EPISODE": "2",
+            "VISUAL_MATCH_CONFIRMED": "1",
         },
     )
     args = capture.read_text(encoding="utf-8").splitlines()
-    assert "--dataset.repo_id=sungkyunner/record-test_20260825_225339" in args
-    assert "--dataset.revision=97e2c1d4d49607210d1e63d46db2a43b530bdf89" in args
-    assert "--dataset.episodes=[0]" in args
+    assert "--policy.path=Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod" in args
+    assert "--policy.pretrained_revision=45f76f173c76c4e002131f8b48e345589a071d0f" in args
+    assert "--dataset.repo_id=owner/real-target" in args
+    assert f"--dataset.revision={'a' * 40}" in args
+    assert "--dataset.episodes=[2]" in args
+    assert f"--verify-provenance={run_root / 'target_provenance.json'}" in args
     assert "--dataset.video_backend=pyav" in args
     assert "--num_workers=0" in args
     assert "--batch_size=8" in args
     assert "--accelerator.gradient_accumulation.steps=8" in args
 
 
-def test_merge_accepts_verified_checkpoint_overrides_and_exact_svd(tmp_path: Path) -> None:
+@pytest.mark.parametrize("command", ["prepare-target", "train-target"])
+def test_target_commands_reject_mutable_revisions(tmp_path: Path, command: str) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    result = subprocess.run(
+        [script, command],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "RUN_ROOT": str(tmp_path / "run"),
+            "TARGET_REV": "main",
+            "VISUAL_MATCH_CONFIRMED": "1",
+        },
+    )
+    assert result.returncode == 2
+    assert "immutable 40-character" in result.stderr
+
+
+def test_merge_uses_only_experiment_m_run_checkpoints_and_anchor(tmp_path: Path) -> None:
     script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
     _, capture = _capture_uv(tmp_path)
     run_root = tmp_path / "run"
-    source = tmp_path / "reused-source"
-    target = tmp_path / "reused-target"
+    source = run_root / "source_finetune/checkpoints/last/pretrained_model"
+    target = run_root / "target_finetune/checkpoints/last/pretrained_model"
     source.mkdir(parents=True)
     target.mkdir(parents=True)
     (source / "model.safetensors").touch()
@@ -137,13 +248,15 @@ def test_merge_accepts_verified_checkpoint_overrides_and_exact_svd(tmp_path: Pat
             "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
             "CAPTURE": str(capture),
             "RUN_ROOT": str(run_root),
-            "SOURCE_CHECKPOINT": str(source),
-            "TARGET_CHECKPOINT": str(target),
+            "SOURCE_CHECKPOINT": str(tmp_path / "old-source"),
+            "TARGET_CHECKPOINT": str(tmp_path / "old-target"),
         },
     )
     args = capture.read_text(encoding="utf-8").splitlines()
     assert args.count(f"--source={source}") == 2
     assert args.count(f"--target={target}") == 2
+    assert args.count("--base=Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod") == 2
+    assert args.count("--base-revision=45f76f173c76c4e002131f8b48e345589a071d0f") == 2
     assert not any(arg.startswith(("--rank=", "--seed=")) for arg in args)
 
 

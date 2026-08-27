@@ -103,3 +103,59 @@ import because the local PyTorch installation cannot load `libcublasLt.so.12`; n
   checkpoint loader. It is an outcome-informed exploratory sensitivity analysis as declared in
   `03_amendment_03_exact_svd.md`, not a replacement for the preregistered D condition.
 - No experimental outcomes were run or interpreted during implementation.
+
+---
+
+# Change log: Amendment 04 Experiment M
+
+Date: 2026-08-27
+
+## Changed files
+
+- `run.sh`: pins the multi-task Experiment M base and episode-170 source, makes the target Hub
+  coordinates configurable with preregistered defaults, rejects mutable target revisions, requires
+  visual-match confirmation before target preparation or either fine-tune, binds target training to
+  matching provenance coordinates, and prevents checkpoint reuse across runs.
+- `prepare_target_dataset.py`: accepts target repo/revision/episode arguments, validates one
+  nonempty 10-FPS episode against the exact task/joint/camera contract without requiring a video
+  codec, writes immutable selected-content and matched-source confirmation provenance without
+  rewriting data, and verifies that provenance before target training.
+- `tests/experiments/test_domain_arithmetic_so101.py`: covers Experiment M pins, independent
+  same-base source/target commands, episode selection, target configurability/revision rejection,
+  codec-independent validation, auditable visual confirmation, provenance binding, content hashing,
+  and the unchanged Experiment M merge anchor.
+
+## Frozen configuration and commands
+
+```text
+Base: Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod
+      @45f76f173c76c4e002131f8b48e345589a071d0f
+Source: Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps
+        @09a0376348f60be89edcbc0eb76c3e26b5f3b094, episode 170
+Target default: sungkyunner/record-test_20260826_210214
+                @295e6def6cb4df454f58894caea10c15446dc4e4, episode 0
+Training: seed 1000, 1,000 updates each, batch 8, accumulation 8, workers 0, LR 5e-5
+Merge: direct and exact-thin-SVD DArT, alpha 0.8, same Experiment M base anchor
+```
+
+```bash
+bash -n experiments/domain_arithmetic_so101/run.sh
+RUN_ROOT=/tmp/domain-arithmetic-m-check-$$ experiments/domain_arithmetic_so101/run.sh check
+uv run ruff check experiments/domain_arithmetic_so101/prepare_target_dataset.py \
+  tests/experiments/test_domain_arithmetic_so101.py
+uv run pytest tests/experiments/test_domain_arithmetic_so101.py -q --tb=short
+```
+
+Shell syntax, workflow, and focused Ruff checks passed. Pytest collection was blocked by the local
+CUDA installation before tests ran: `ImportError: libcublasLt.so.12: cannot open shared object
+file`. No training, merge, hardware rollout, or result interpretation was performed.
+
+## Assumptions and deviations
+
+- The operator must visually confirm that source episode 170 and the selected target episode show
+  the same approximate red-block start position, then explicitly set `VISUAL_MATCH_CONFIRMED=1`;
+  target preparation records that confirmation and target training rejects mismatched provenance.
+- Target overrides remain valid only with an immutable 40-character lowercase Hub commit SHA and a
+  fresh `RUN_ROOT`; all Experiment M checkpoints are produced inside that run.
+- DArT arithmetic, exact-SVD behavior, alpha, metrics, seeds, budgets, and evaluation criteria were
+  not changed. This remains a native PyTorch/SmolVLA port rather than the paper's OpenPI/JAX code.
