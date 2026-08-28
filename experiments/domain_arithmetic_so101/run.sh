@@ -5,9 +5,9 @@ BASE="Cache-SCA/smolVLA-IsaacLab-Multi-Task-8epoch-mod"
 BASE_REV="45f76f173c76c4e002131f8b48e345589a071d0f"
 SOURCE_DATASET="Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
 SOURCE_REV="09a0376348f60be89edcbc0eb76c3e26b5f3b094"
-SOURCE_EPISODE=170
-DEFAULT_TARGET_REPO_ID="sungkyunner/record-test_20260826_210214"
-DEFAULT_TARGET_REV="295e6def6cb4df454f58894caea10c15446dc4e4"
+SOURCE_EPISODE=257
+DEFAULT_TARGET_REPO_ID="sungkyunner/record-test_20260826_191215"
+DEFAULT_TARGET_REV="25589b8ebb14255c885edabb36168f5e36a6bafa"
 DEFAULT_TARGET_EPISODE=0
 TARGET_REPO_ID="${TARGET_REPO_ID:-$DEFAULT_TARGET_REPO_ID}"
 TARGET_REV="${TARGET_REV:-$DEFAULT_TARGET_REV}"
@@ -39,7 +39,7 @@ require_target_coordinates() {
 
 require_visual_match() {
   [[ "${VISUAL_MATCH_CONFIRMED:-}" == 1 ]] || {
-    echo "visually match source episode 170 and the target layout, then set VISUAL_MATCH_CONFIRMED=1" >&2
+    echo "visually match source episode $SOURCE_EPISODE and the target layout, then set VISUAL_MATCH_CONFIRMED=1" >&2
     exit 2
   }
 }
@@ -202,9 +202,9 @@ case "${1:-}" in
     [[ "$BASE_REV" == "45f76f173c76c4e002131f8b48e345589a071d0f" ]]
     [[ "$SOURCE_DATASET" == "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps" ]]
     [[ "$SOURCE_REV" == "09a0376348f60be89edcbc0eb76c3e26b5f3b094" ]]
-    [[ "$SOURCE_EPISODE" == 170 ]]
-    [[ "$DEFAULT_TARGET_REPO_ID" == "sungkyunner/record-test_20260826_210214" ]]
-    [[ "$DEFAULT_TARGET_REV" == "295e6def6cb4df454f58894caea10c15446dc4e4" ]]
+    [[ "$SOURCE_EPISODE" == 257 ]]
+    [[ "$DEFAULT_TARGET_REPO_ID" == "sungkyunner/record-test_20260826_191215" ]]
+    [[ "$DEFAULT_TARGET_REV" == "25589b8ebb14255c885edabb36168f5e36a6bafa" ]]
     [[ "$DEFAULT_TARGET_EPISODE" == 0 ]]
     require_target_coordinates
     [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]

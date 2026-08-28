@@ -78,11 +78,12 @@ def _target_fixture(frame_count: int = 300) -> object:
 
 def test_experiment_m_target_contract_needs_no_interface_or_codec_conversion() -> None:
     validate_target_contract(_target_fixture())
-    assert prepare_target_dataset.DEFAULT_TARGET_REPO == "sungkyunner/record-test_20260826_210214"
+    assert prepare_target_dataset.DEFAULT_TARGET_REPO == "sungkyunner/record-test_20260826_191215"
     assert (
         prepare_target_dataset.DEFAULT_TARGET_REVISION
-        == "295e6def6cb4df454f58894caea10c15446dc4e4"
+        == "25589b8ebb14255c885edabb36168f5e36a6bafa"
     )
+    assert prepare_target_dataset.DEFAULT_TARGET_EPISODE == 0
     assert not hasattr(prepare_target_dataset, "canonicalize_joint_vector")
 
 
@@ -127,7 +128,7 @@ def test_target_provenance_records_selected_coordinates_and_hash(tmp_path: Path,
         == "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
     )
     assert provenance["matched_source_revision"] == "09a0376348f60be89edcbc0eb76c3e26b5f3b094"
-    assert provenance["matched_source_episode"] == 170
+    assert provenance["matched_source_episode"] == 257
     assert provenance["selected_frames"] == 17
     assert provenance["selected_content_sha256"] == provenance["content_manifest"]["tree_sha256"]
     validate_target_provenance(output, "owner/target", "a" * 40, 2)
@@ -157,7 +158,28 @@ def _capture_uv(tmp_path: Path) -> tuple[Path, Path]:
     return binary, capture
 
 
-def test_source_training_uses_experiment_m_anchor_and_episode_170(tmp_path: Path) -> None:
+def test_prepare_target_uses_amended_immutable_default(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
+    _, capture = _capture_uv(tmp_path)
+    subprocess.run(
+        [script, "prepare-target"],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "RUN_ROOT": str(tmp_path / "run"),
+            "VISUAL_MATCH_CONFIRMED": "1",
+        },
+    )
+    args = capture.read_text(encoding="utf-8").splitlines()
+    assert "--repo-id=sungkyunner/record-test_20260826_191215" in args
+    assert "--revision=25589b8ebb14255c885edabb36168f5e36a6bafa" in args
+    assert "--episode=0" in args
+    assert "--visual-match-confirmed" in args
+
+
+def test_source_training_uses_experiment_m_anchor_and_episode_257(tmp_path: Path) -> None:
     script = Path(__file__).parents[2] / "experiments/domain_arithmetic_so101/run.sh"
     _, capture = _capture_uv(tmp_path)
     subprocess.run(
@@ -177,7 +199,7 @@ def test_source_training_uses_experiment_m_anchor_and_episode_170(tmp_path: Path
     assert "--policy.empty_cameras=1" in args
     assert "--dataset.repo_id=Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps" in args
     assert "--dataset.revision=09a0376348f60be89edcbc0eb76c3e26b5f3b094" in args
-    assert "--dataset.episodes=[170]" in args
+    assert "--dataset.episodes=[257]" in args
 
 
 def test_target_training_uses_same_anchor_and_configurable_immutable_episode(tmp_path: Path) -> None:

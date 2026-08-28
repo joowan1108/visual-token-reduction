@@ -9,12 +9,12 @@ from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-DEFAULT_TARGET_REPO = "sungkyunner/record-test_20260826_210214"
-DEFAULT_TARGET_REVISION = "295e6def6cb4df454f58894caea10c15446dc4e4"
+DEFAULT_TARGET_REPO = "sungkyunner/record-test_20260826_191215"
+DEFAULT_TARGET_REVISION = "25589b8ebb14255c885edabb36168f5e36a6bafa"
 DEFAULT_TARGET_EPISODE = 0
 MATCHED_SOURCE_DATASET = "Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps"
 MATCHED_SOURCE_REVISION = "09a0376348f60be89edcbc0eb76c3e26b5f3b094"
-MATCHED_SOURCE_EPISODE = 170
+MATCHED_SOURCE_EPISODE = 257
 TARGET_TASK = "Pick up the red block and place it on the blue dish."
 CAMERA_KEYS = ("observation.images.left_wrist", "observation.images.top")
 JOINT_NAMES = (
