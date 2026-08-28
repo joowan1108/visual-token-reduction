@@ -93,10 +93,10 @@ train_common=(
   --optimizer.grad_clip_norm=1.0
   --scheduler.type=constant_with_warmup
   --scheduler.num_warmup_steps=0
-  --steps=2000
-  --batch_size=4
+  --steps=1000
+  --batch_size=8
   --num_workers=0
-  --accelerator.gradient_accumulation.steps=16
+  --accelerator.gradient_accumulation.steps=8
   --seed=1000
   --cudnn_deterministic=true
   --dataset.image_transforms.enable=false
@@ -211,13 +211,13 @@ case "${1:-}" in
     [[ " ${train_common[*]} " == *" --policy.empty_cameras=1 "* ]]
     [[ " ${train_common[*]} " == *" --policy.freeze_vision_encoder=true "* ]]
     [[ " ${train_common[*]} " == *" --policy.train_expert_only=true "* ]]
-    [[ " ${train_common[*]} " == *" --steps=2000 "* ]]
+    [[ " ${train_common[*]} " == *" --steps=1000 "* ]]
     [[ " ${train_common[*]} " == *" --save_freq=500 "* ]]
     [[ " ${train_common[*]} " == *" --scheduler.type=constant_with_warmup "* ]]
     [[ " ${train_common[*]} " == *" --scheduler.num_warmup_steps=0 "* ]]
-    [[ " ${train_common[*]} " == *" --batch_size=4 "* ]]
+    [[ " ${train_common[*]} " == *" --batch_size=8 "* ]]
     [[ " ${train_common[*]} " == *" --num_workers=0 "* ]]
-    [[ " ${train_common[*]} " == *" --accelerator.gradient_accumulation.steps=16 "* ]]
+    [[ " ${train_common[*]} " == *" --accelerator.gradient_accumulation.steps=8 "* ]]
     [[ " ${train_common[*]} " == *" --dataset.video_backend=pyav "* ]]
     [[ "$(condition_path Z)" == "$BASE" ]]
     [[ "$(condition_path F)" == "$TARGET_OUTPUT/checkpoints/last/pretrained_model" ]]

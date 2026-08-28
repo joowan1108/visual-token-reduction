@@ -201,6 +201,10 @@ def test_source_training_uses_experiment_m_anchor_and_episode_257(tmp_path: Path
     assert "--dataset.repo_id=Cache-SCA/Isaaclab-so101_11task_baseCaP_3300epi_10fps" in args
     assert "--dataset.revision=09a0376348f60be89edcbc0eb76c3e26b5f3b094" in args
     assert "--dataset.episodes=[257]" in args
+    assert "--steps=1000" in args
+    assert "--batch_size=8" in args
+    assert "--accelerator.gradient_accumulation.steps=8" in args
+    assert "--save_freq=500" in args
 
 
 def test_target_training_uses_same_anchor_and_configurable_immutable_episode(tmp_path: Path) -> None:
@@ -234,8 +238,10 @@ def test_target_training_uses_same_anchor_and_configurable_immutable_episode(tmp
     assert f"--verify-provenance={run_root / 'target_provenance.json'}" in args
     assert "--dataset.video_backend=pyav" in args
     assert "--num_workers=0" in args
+    assert "--steps=1000" in args
     assert "--batch_size=8" in args
     assert "--accelerator.gradient_accumulation.steps=8" in args
+    assert "--save_freq=500" in args
 
 
 @pytest.mark.parametrize("command", ["prepare-target", "train-target"])
