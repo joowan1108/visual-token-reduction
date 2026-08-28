@@ -78,7 +78,7 @@ train_common=(
   --policy.path="$BASE"
   --policy.pretrained_revision="$BASE_REV"
   --policy.freeze_vision_encoder=true
-  --policy.train_expert_only=true
+  --policy.train_expert_only=false
   --policy.use_amp=false
   --policy.push_to_hub=false
   --preserve_pretrained_processor_stats=true
@@ -93,9 +93,9 @@ train_common=(
   --scheduler.type=constant_with_warmup
   --scheduler.num_warmup_steps=0
   --steps=2000
-  --batch_size=8
+  --batch_size=4
   --num_workers=0
-  --accelerator.gradient_accumulation.steps=8
+  --accelerator.gradient_accumulation.steps=16
   --seed=1000
   --cudnn_deterministic=true
   --dataset.image_transforms.enable=false
@@ -207,13 +207,15 @@ case "${1:-}" in
     [[ "$DEFAULT_TARGET_EPISODE" == 0 ]]
     require_target_coordinates
     [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]
+    [[ " ${train_common[*]} " == *" --policy.freeze_vision_encoder=true "* ]]
+    [[ " ${train_common[*]} " == *" --policy.train_expert_only=false "* ]]
     [[ " ${train_common[*]} " == *" --steps=2000 "* ]]
     [[ " ${train_common[*]} " == *" --save_freq=500 "* ]]
     [[ " ${train_common[*]} " == *" --scheduler.type=constant_with_warmup "* ]]
     [[ " ${train_common[*]} " == *" --scheduler.num_warmup_steps=0 "* ]]
-    [[ " ${train_common[*]} " == *" --batch_size=8 "* ]]
+    [[ " ${train_common[*]} " == *" --batch_size=4 "* ]]
     [[ " ${train_common[*]} " == *" --num_workers=0 "* ]]
-    [[ " ${train_common[*]} " == *" --accelerator.gradient_accumulation.steps=8 "* ]]
+    [[ " ${train_common[*]} " == *" --accelerator.gradient_accumulation.steps=16 "* ]]
     [[ " ${train_common[*]} " == *" --dataset.video_backend=pyav "* ]]
     [[ "$(condition_path Z)" == "$BASE" ]]
     [[ "$(condition_path F)" == "$TARGET_OUTPUT/checkpoints/last/pretrained_model" ]]
