@@ -77,6 +77,7 @@ selected_revision() {
 train_common=(
   --policy.path="$BASE"
   --policy.pretrained_revision="$BASE_REV"
+  --policy.empty_cameras=1
   --policy.freeze_vision_encoder=true
   --policy.train_expert_only=false
   --policy.use_amp=false
@@ -207,6 +208,7 @@ case "${1:-}" in
     [[ "$DEFAULT_TARGET_EPISODE" == 0 ]]
     require_target_coordinates
     [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]
+    [[ " ${train_common[*]} " == *" --policy.empty_cameras=1 "* ]]
     [[ " ${train_common[*]} " == *" --policy.freeze_vision_encoder=true "* ]]
     [[ " ${train_common[*]} " == *" --policy.train_expert_only=false "* ]]
     [[ " ${train_common[*]} " == *" --steps=2000 "* ]]

@@ -19,7 +19,7 @@ INFERENCE_TYPE="${INFERENCE_TYPE:-rtc}"
 RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-10}"
 RTC_MAX_GUIDANCE_WEIGHT="${RTC_MAX_GUIDANCE_WEIGHT:-10}"
 
-policy_args=(--policy.path="$POLICY_PATH")
+policy_args=(--policy.path="$POLICY_PATH" --policy.empty_cameras=1)
 [[ -z "$POLICY_REVISION" ]] || policy_args+=(--policy.pretrained_revision="$POLICY_REVISION")
 inference_args=(--inference.type="$INFERENCE_TYPE")
 if [[ "$INFERENCE_TYPE" == rtc ]]; then
