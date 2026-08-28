@@ -79,7 +79,7 @@ train_common=(
   --policy.pretrained_revision="$BASE_REV"
   --policy.empty_cameras=1
   --policy.freeze_vision_encoder=true
-  --policy.train_expert_only=false
+  --policy.train_expert_only=true
   --policy.use_amp=false
   --policy.push_to_hub=false
   --preserve_pretrained_processor_stats=true
@@ -210,7 +210,7 @@ case "${1:-}" in
     [[ "$TARGET_PROVENANCE" == "$RUN_ROOT/target_provenance.json" ]]
     [[ " ${train_common[*]} " == *" --policy.empty_cameras=1 "* ]]
     [[ " ${train_common[*]} " == *" --policy.freeze_vision_encoder=true "* ]]
-    [[ " ${train_common[*]} " == *" --policy.train_expert_only=false "* ]]
+    [[ " ${train_common[*]} " == *" --policy.train_expert_only=true "* ]]
     [[ " ${train_common[*]} " == *" --steps=2000 "* ]]
     [[ " ${train_common[*]} " == *" --save_freq=500 "* ]]
     [[ " ${train_common[*]} " == *" --scheduler.type=constant_with_warmup "* ]]
